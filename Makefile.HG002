@@ -1,0 +1,2118 @@
+SHELL := /bin/bash -o pipefail
+
+TEMPDIR ?= $(SCRATCH)
+THREADS ?= 1
+VERBOSE ?=
+LOG_LEVEL ?= -v
+TOIL_ARGS ?=
+
+NPSV_ROOT ?= /home/mlinderman/research/npsv
+
+VCF2PARAGRAPH ?= $(PARAGRAPH_BUILD)/bin/vcf2paragraph.py
+GRMPY ?= $(PARAGRAPH_BUILD)/bin/grmpy
+
+REFERENCE ?= /storage/mlinderman/ngs/resources/gatk/b37/human_g1k_v37.fasta
+GENOME ?= $(NPSV_ROOT)/etc/human_g1k_v37.genome
+GAPS ?= $(NPSV_ROOT)/etc/human_g1k_v37.gaps.bed.gz
+DBSNP_VCF ?= /storage/mlinderman/ngs/resources/gatk/b37/dbsnp_138.b37.vcf.gz
+SIMPLE_REPEATS ?= /storage/mlinderman/ngs/resources/annotations/simple_repeats.b37.bed.gz
+
+PED ?= ashkenazi-trio.ped
+BAM ?= /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG002/HG002-ready.bam
+PAT_BAM ?= /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG003/HG003-ready.bam
+MAT_BAM ?= /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG004/HG004-ready.bam
+SNV ?= /storage/mlinderman/ngs/resources/ashkenazi-trio/final/2019-06-13_project/ashkenazi-gatk-haplotype-annotated.vcf.gz
+
+LUMPY_VCF ?= /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG002/ashkenazi-lumpy.vcf.gz
+MANTA_VCF ?= /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG002/ashkenazi-manta.vcf.gz
+
+GIAB_BED = HG002_SVs_Tier1_v0.6.bed
+GIAB_ALL_TIERS_BED = HG002_SVs_Tier1and2_v0.6.bed
+
+COVERAGE ?= 25
+READ_LENGTH ?= 148
+MEAN_FRAGMENT ?= 569 
+STD_FRAGMENT ?= 163
+PROFILE ?= HS25
+
+ITER ?= 100
+REUSE ?= --reuse
+SIMREF ?= 
+
+SINGLE_KLASS ?= svm
+VARIANT_KLASS ?= rf
+HYBRID_KLASS ?= svm
+HYBRID_SIZE ?= 1000
+
+# Common indexing operations
+%.vcf.gz.gbi : %.vcf.gz
+	grabix index $<
+
+%.longreadhomref.vcf.gz : %.vcf.gz
+	bcftools annotate -Oz -o $@ -x "FILTER/LongReadHomRef" $<
+	bcftools index -t $@
+
+%.nofilt.vcf.gz : %.vcf.gz
+	bcftools annotate -Oz -o $@ -x "FILTER" $<
+	bcftools index -t $@
+
+# Select just deletions or insertions
+%.DEL.vcf.gz  : %.vcf.gz 
+	bcftools view -Oz -o $@ -i '(SVTYPE ~ "^DEL")' $<
+	bcftools index -t $@
+
+%.INS.vcf.gz  : %.vcf.gz 
+	bcftools view -Oz -o $@ -i '(SVTYPE ~ "^INS")' $<
+	bcftools index -t $@
+
+# Manage reference data
+load_shared_ref: $(REFERENCE)
+	bwa shm $<
+
+unload_shared_ref: $(REFERENCE)
+	bwa shm -d
+
+# GIAB call set
+
+# Combined BED files
+HG002_SVs_Tier1and2_v0.6.bed : HG002_SVs_Tier1_v0.6.bed HG002_SVs_Tier1plusTier2_v0.6.1.bed
+	cat $^ | sort -k1,1 -k2,2n > $(TEMPDIR)/$@
+	bedtools merge -i $(TEMPDIR)/$@ > $@
+
+# Select just variants, >50 bp, with actual genotypes, 
+HG002_SVs_Tier1_v0.6.genotyped.vcf.gz : HG002_SVs_Tier1_v0.6.vcf.gz
+	bcftools view -Oz -o $@ -g ^miss -i '(INFO/sizecat != "20to49")' $<
+	bcftools index -t $@
+
+# Select just variants, >50 bp, with actual genotypes and PASS or LongReadHomRef filters
+HG002_SVs_Tier1_v0.6.genotyped.passing.vcf.gz : HG002_SVs_Tier1_v0.6.vcf.gz
+	bcftools view -Oz -o $@ -g ^miss -f 'PASS,LongReadHomRef' -i '(INFO/sizecat != "20to49")' $<
+	bcftools index -t $@
+
+# Select just variants, >50 bp, with actual genotypes in Tier 1 regions
+HG002_SVs_Tier1_v0.6.genotyped.tier1.vcf.gz : HG002_SVs_Tier1_v0.6.vcf.gz
+	bcftools view -Oz -o $@ -g ^miss -R $(GIAB_BED) -i '(INFO/sizecat != "20to49")' $<
+	bcftools index -t $@
+
+# Select just variants, >50 bp, with actual genotypes and PASS or LongReadHomRef filters in Tier 1 regions
+HG002_SVs_Tier1_v0.6.genotyped.passing.tier1.vcf.gz : HG002_SVs_Tier1_v0.6.vcf.gz
+	bcftools view -Oz -o $@ -g ^miss -f 'PASS,LongReadHomRef' -R $(GIAB_BED) -i '(INFO/sizecat != "20to49")' $<
+	bcftools index -t $@
+
+# Select just passing variants, >50 bp, with actual genotypes in Tier 1 and 2 regions
+HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz : HG002_SVs_Tier1_v0.6.vcf.gz
+	bcftools view -Oz -o $@ -g ^miss -f 'PASS,LongReadHomRef' -R $(GIAB_ALL_TIERS_BED) -i '(INFO/sizecat != "20to49")' $<
+	bcftools index -t $@
+
+# GIAB deletions
+
+# Select just deletions >50bp
+HG002_SVs_Tier1_v0.6.DEL.vcf.gz  : HG002_SVs_Tier1_v0.6.vcf.gz 
+	bcftools view -Oz -o $@ -i '(SVTYPE = "DEL" & INFO/sizecat != "20to49")' $<
+	bcftools index -t $@
+
+# GIAB insertions
+
+# Select just insertions >50bp
+HG002_SVs_Tier1_v0.6.INS.vcf.gz  : HG002_SVs_Tier1_v0.6.vcf.gz 
+	bcftools view -Oz -o $@ -i '(SVTYPE = "INS" & INFO/sizecat != "20to49")' $<
+	bcftools index -t $@
+
+# SV Curate manual curation
+HG002_SVs_Tier1_v0.6.svcurate.vcf.gz : journal.pcbi.1007933.s008.txt HG002_SVs_Tier1_v0.6.vcf.gz
+	tabix -H $(word 2,$^) > $(@:.vcf.gz=.vcf)
+	zgrep -Fwf <(awk 'NR > 1 { print $$1; }' $<) $(word 2,$^) >> $(@:.vcf.gz=.vcf)
+	bgzip $(@:.vcf.gz=.vcf) && tabix $@
+
+HG002_SVs_Tier1_v0.6.svcurate.DEL.vcf.gz : HG002_SVs_Tier1_v0.6.svcurate.vcf.gz
+	bcftools view -Oz -o $@ -i '(SVTYPE = "DEL" & INFO/sizecat != "20to49")' $<
+	bcftools index -t $@
+
+giab_datasets: \
+	HG002_SVs_Tier1_v0.6.genotyped.vcf.gz \
+	HG002_SVs_Tier1_v0.6.genotyped.passing.vcf.gz \
+	HG002_SVs_Tier1_v0.6.genotyped.tier1.vcf.gz \
+	HG002_SVs_Tier1_v0.6.genotyped.passing.tier1.vcf.gz \
+	HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz \
+	HG002_SVs_Tier1_v0.6.DEL.vcf.gz \
+	HG002_SVs_Tier1_v0.6.INS.vcf.gz
+
+.PHONY: giab_datasets
+
+%.len-dist.csv : %.vcf.gz
+	bcftools query -f '%INFO/SVLEN\n' $< > $@
+
+len_dist : \
+	HG002_SVs_Tier1_v0.6.genotyped.passing.tier1.len-dist.csv \
+	HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.len-dist.csv
+
+.PHONY: len_dist
+
+
+# Alternate "GAPS"
+
+# Inspired by samplot-ml, try to force random variants into more awkward regions...
+
+combined_tier1_and_gaps.bed.gz : HG002_SVs_Tier1_v0.6.bed $(NPSV_ROOT)/etc/human_g1k_v37.gaps.bed.gz
+	cat $< <(gzip -dc $(NPSV_ROOT)/etc/human_g1k_v37.gaps.bed.gz) | sort -k1,1 -k2,2n > $(TEMPDIR)/$(@:.bed.gz=.bed)
+	bedtools merge -i $(TEMPDIR)/$(@:.bed.gz=.bed) | bgzip > $@
+	tabix -p bed $@
+
+blacklist.bed.gz : /storage/mlinderman/ngs/resources/annotations/encode_blacklist.b37.bed.gz /storage/mlinderman/ngs/resources/annotations/ucsc_unusual_regions.b37.bed.gz $(NPSV_ROOT)/etc/human_g1k_v37.gaps.bed.gz
+	gzip -dc $^ | cut -f 1-3 | sort -k1,1 -k2,2n > $(TEMPDIR)/$(@:.bed.gz=.bed)
+	bedtools merge -i $(TEMPDIR)/$(@:.bed.gz=.bed) | bgzip > $@
+	tabix -p bed $@
+
+# Preprocessing
+
+define PICARD_template =
+picard_metrics/$(notdir $(1:.bam=.gc_bias.detail_metrics)) picard_metrics/$(notdir $(1:.bam=.alignment_summary_metrics)) picard_metrics/$(notdir $(1:.bam=.insert_size_metrics)) : $(1)
+	mkdir -p $$(dir $$@)
+	java -jar $(PICARD_JAR) CollectMultipleMetrics \
+		I=$$< \
+		O=$$(@:.gc_bias.detail_metrics=) \
+		R=$(REFERENCE) \
+		DB_SNP=$(DBSNP_VCF) \
+		PROGRAM=null \
+		PROGRAM=CollectGcBiasMetrics \
+		PROGRAM=CollectAlignmentSummaryMetrics \
+		PROGRAM=CollectInsertSizeMetrics
+
+picard_metrics/$(notdir $(1:.bam=.wgs_metrics)) : $(1)
+	mkdir -p $$(dir $$@)
+	java -jar $(PICARD_JAR) CollectWgsMetrics \
+		I=$$< \
+		O=$$@ \
+		R=$(REFERENCE) 
+
+picard_metrics/$(notdir $(1:.bam=.fragment.gc_bias.detail_metrics)) : $(1)
+	mkdir -p $$(dir $$@)
+	java -jar $(PICARD_JAR) CollectGcBiasMetrics \
+		I=$$< \
+		O=$$@ \
+		S=$$(@:.gc_bias.detail_metrics=.gc_bias.summary_metrics) \
+		CHART=$$(@:.gc_bias.detail_metrics=.gc_bias.pdf) \
+		R=$(REFERENCE) \
+		WINDOW_SIZE=$(MEAN_FRAGMENT)	
+endef
+
+$(eval $(call PICARD_template,$(BAM)))
+$(eval $(call PICARD_template,$(PAT_BAM)))
+$(eval $(call PICARD_template,$(MAT_BAM)))
+
+define PREPROCESS_template =
+$(notdir $(1:.bam=.stats.json)) : $(1) picard_metrics/$(notdir $(1:.bam=.gc_bias.detail_metrics)) picard_metrics/$(notdir $(1:.bam=.insert_size_metrics))
+	npsvg -t $(TEMPDIR) preprocess -r $(REFERENCE) -b $$< --picard-gc $$(word 2,$$^) --picard-insert $$(word 3,$$^) -o $$@
+endef
+
+$(eval $(call PREPROCESS_template,$(BAM)))
+$(eval $(call PREPROCESS_template,$(PAT_BAM)))
+$(eval $(call PREPROCESS_template,$(MAT_BAM)))
+
+# Test stats from CRAM
+HG002-ready.cram.stats.json : /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG002/HG002-ready.cram picard_metrics/$(notdir $(BAM:.bam=.gc_bias.detail_metrics)) picard_metrics/$(notdir $(BAM:.bam=.insert_size_metrics))
+	#npsvg -t $(TEMPDIR) preprocess -r $(REFERENCE) --picard-gc $(word 2,$^) --picard-insert $(word 3,$^) -b $< -o $@
+	npsvg -t $(TEMPDIR) preprocess -r $(REFERENCE) --genome $(GENOME) -b $< -o $@
+
+# NPSV
+
+# Create VCFs with specific genotypes to faciliate create truth tables
+%.0.vcf.gz : %.vcf.gz
+	bcftools view -C 1 -g hom -Oz -o $@ $<
+	bcftools index -t $@
+
+%.1.vcf.gz : %.vcf.gz
+	bcftools view -g het -Oz -o $@ $<
+	bcftools index -t $@
+
+%.2.vcf.gz : %.vcf.gz
+	bcftools view -c 1 -g hom -Oz -o $@ $<
+	bcftools index -t $@
+
+# Chunk inputs to facilitate parallel processing. This command can actually be submited with sbatch
+giab_all_inputs: HG002_SVs_Tier1_v0.6.vcf.gz HG002_SVs_Tier1_v0.6.vcf.gz.gbi
+	./slurm/giab_inputs.bash $< $@
+
+giab_inputs: HG002_SVs_Tier1_v0.6.DEL.vcf.gz HG002_SVs_Tier1_v0.6.DEL.vcf.gz.gbi
+	./slurm/giab_inputs.bash $< $@
+
+giab_DEL_filtered_inputs: HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.vcf.gz.gbi
+	./slurm/giab_inputs.bash $< $@
+
+GIAB_DEL_FILTERED_BLOCKS := $(shell seq 1 100 8400)
+GIAB_DEL_FILTERED_LAST := 8401_8439
+
+giab_INS_filtered_inputs: HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.INS.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.INS.vcf.gz.gbi
+	./slurm/giab_inputs.bash $< $@
+
+GIAB_INS_FILTERED_BLOCKS := $(shell seq 1 100 8400)
+GIAB_INS_FILTERED_LAST := 8401_8432
+
+giab_filtered_inputs: HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz.gbi
+	./slurm/giab_inputs.bash $< $@
+
+GIAB_FILTERED_BLOCKS := $(shell seq 1 100 16800)
+GIAB_FILTERED_LAST := 16801_16871
+
+define REAL_WITH_AC_template =
+$(4)/$(2).%.$(1).real.tsv : %.$(1).vcf.gz $(3) $(notdir $(3:.bam=.stats.json))
+	npsvg -t $(TEMPDIR) --threads $(THREADS) \
+		features \
+		-r $(REFERENCE) -i $$< -b $$(word 2,$$^) -o $$@ \
+		--stats-path $$(word 3,$$^) \
+		--ac $(1)
+endef
+
+# Combined (both deletions and insertions)
+npsv_giab_combined/%.npsv.vcf npsv_giab_combined/%.sim.tsv npsv_giab_combined/%.real.tsv : giab_filtered_inputs/%.vcf.gz $(BAM) $(notdir $(BAM:.bam=.stats.json))
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-gt-mode variant --DEL-n $(ITER) --DEL-classifier $(VARIANT_KLASS) \
+  		--INS-gt-mode variant --INS-n $(ITER) --INS-classifier $(VARIANT_KLASS) 
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+# Single model genotyping
+HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) \
+		--samples HG002 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS)  \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Per-variant VCF genotyping
+HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 \
+		--DEL-gt-mode variant --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-classifier $(VARIANT_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Hybrid model VCF genotyping
+HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) \
+		--samples HG002 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+$(eval $(call REAL_WITH_AC_template,0,HG002,$(BAM),npsv_giab_combined))
+$(eval $(call REAL_WITH_AC_template,1,HG002,$(BAM),npsv_giab_combined))
+$(eval $(call REAL_WITH_AC_template,2,HG002,$(BAM),npsv_giab_combined))
+
+
+npsv_giab_combined_HG003/%.npsv.vcf npsv_giab_combined_HG003/%.sim.tsv npsv_giab_combined_HG003/%.real.tsv npsv_giab_combined_HG003/%.npsv.vcf.gz : %.vcf.gz $(PAT_BAM) $(notdir $(PAT_BAM:.bam=.stats.json))
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-gt-mode variant --DEL-n $(ITER) --DEL-classifier $(VARIANT_KLASS) \
+  		--INS-gt-mode variant --INS-n $(ITER) --INS-classifier $(VARIANT_KLASS)
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+	bgzip -c $(dir $@)/$*.npsv.vcf > $(dir $@)/$*.npsv.vcf.gz
+	tabix $(dir $@)/$*.npsv.vcf.gz
+
+# Single model genotyping
+HG003.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG003/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv npsv_giab_combined_HG003/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) \
+		--samples HG003 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS)  \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Per-variant VCF genotyping
+HG003.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.vcf.gz : npsv_giab_combined_HG003/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.npsv.vcf
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 \
+		--DEL-gt-mode variant --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-classifier $(VARIANT_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Hybrid model VCF genotyping
+HG003.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG003/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv npsv_giab_combined_HG003/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) \
+		--samples HG003 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+npsv_giab_combined_HG004/%.npsv.vcf npsv_giab_combined_HG004/%.sim.tsv npsv_giab_combined_HG004/%.real.tsv npsv_giab_combined_HG004/%.npsv.vcf.gz : %.vcf.gz $(MAT_BAM) $(notdir $(MAT_BAM:.bam=.stats.json))
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-gt-mode variant --DEL-n $(ITER) --DEL-classifier $(VARIANT_KLASS) \
+  		--INS-gt-mode variant --INS-n $(ITER) --INS-classifier $(VARIANT_KLASS)
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+	bgzip -c $(dir $@)/$*.npsv.vcf > $(dir $@)/$*.npsv.vcf.gz
+	tabix $(dir $@)/$*.npsv.vcf.gz
+
+# Single model genotyping
+HG004.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG004/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv npsv_giab_combined_HG004/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) \
+		--samples HG004 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS)  \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Per-variant VCF genotyping
+HG004.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.vcf.gz : npsv_giab_combined_HG004/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.npsv.vcf
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG004 \
+		--DEL-gt-mode variant --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-classifier $(VARIANT_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Hybrid model VCF genotyping
+HG004.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG004/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv npsv_giab_combined_HG004/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) \
+		--samples HG004 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Proposal
+
+npsv_giab_propose_DEL/%.vcf.gz : giab_DEL_filtered_inputs/%.vcf.gz
+	npsvg propose -r $(REFERENCE) --simple-repeats $(SIMPLE_REPEATS) -i $< | \
+		bcftools sort -Oz -o $@ -
+	bcftools index -t $@
+
+# Rule to genotype individual chunks with BWA-based realigner with variant proposing
+npsv_giab_propose_DEL/%.npsv.vcf npsv_giab_propose_DEL/%.sim.tsv npsv_giab_propose_DEL/%.real.tsv : npsv_giab_propose_DEL/%.vcf.gz $(BAM) $(notdir $(BAM:.bam=.stats.json))
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-n $(ITER) \
+		--DEL-gt-mode variant \
+		--DEL-classifier $(VARIANT_KLASS) \
+		--dm2
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+npsv_giab_propose_DEL/%.propose.npsv.vcf.gz : npsv_giab_propose_DEL/%.npsv.vcf
+	npsvg genotype -i $(<:.npsv.vcf=.vcf.gz) --sim $(<:.npsv.vcf=.sim.tsv) --real $(<:.npsv.vcf=.real.tsv) --DEL-gt-mode variant --DEL-classifier rf --dm2 | \
+		npsvg refine -i /dev/stdin --select dm2 | \
+		bcftools sort -Oz -o $@ -
+	bcftools index -t $@
+
+# 'Full' local classifier with variant proposal
+HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.variant.npsv.DEL.vcf.gz : $(foreach start, $(GIAB_DEL_FILTERED_BLOCKS), npsv_giab_propose_DEL/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.$(start)_$(shell expr $(start) + 100 - 1 ).propose.npsv.vcf.gz) npsv_giab_propose_DEL/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.$(GIAB_DEL_FILTERED_LAST).propose.npsv.vcf.gz
+	bcftools concat -a -Oz -o $@ $^
+	bcftools index -t $@
+
+# Construct hybrid model by combining single model for large variants and variant proposal for smaller variants. We use this
+# ad-hoc approach for testing, so we can compare without and without hybrid. This feature is built into the variant proposer.
+HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.hybrid.npsv.DEL.vcf.gz : HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.vcf.gz HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.propose.npsv.DEL.vcf.gz
+	bcftools view -Oz -i '(INFO/END - POS) <= $(HYBRID_SIZE)' $(word 2,$^) > $(TEMPDIR)/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.propose.small.npsv.vcf.gz
+	bcftools index -t $(TEMPDIR)/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.propose.small.npsv.vcf.gz
+	bcftools view -Oz -i '(INFO/END - POS) > $(HYBRID_SIZE)' $(word 1,$^) > $(TEMPDIR)/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.large.npsv.vcf.gz
+	bcftools index -t $(TEMPDIR)/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.large.npsv.vcf.gz
+	bcftools concat -a -Oz -o $@ $(TEMPDIR)/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.propose.small.npsv.vcf.gz $(TEMPDIR)/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.large.npsv.vcf.gz
+	bcftools index -t $@
+
+# "Cross-sample" modeling
+
+# Overwrite sample name to fool variant model
+npsv_giab_combined_%/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG002.sim.tsv : npsv_giab_combined_%/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv
+	awk 'BEGIN { OFS="\t"; } /^#/ { print; } ! /^#/ { $$5 = "HG002"; print; }' $< > $@
+
+npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG003.single.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG003/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG002.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --downsample 1 --DEL-gt-mode single --INS-gt-mode single --DEL-classifier svm --INS-classifier svm --filter-bed $(GIAB_BED) | bgzip > $@
+	bcftools index -t $@
+
+npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG003.variant.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG003/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG002.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --DEL-gt-mode variant --INS-gt-mode variant --DEL-classifier rf --INS-classifier rf | bgzip > $@
+	bcftools index -t $@
+
+npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG003.hybrid.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG003/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG002.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 \
+		--DEL-gt-mode hybrid --DEL-classifier rf --DEL-hybrid-threshold $(HYBRID_SIZE) \
+		--INS-gt-mode hybrid --INS-classifier rf --INS-hybrid-threshold $(HYBRID_SIZE)| bgzip > $@
+	bcftools index -t $@
+
+npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG004.single.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG004/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG002.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --downsample 1 --DEL-gt-mode single --INS-gt-mode single --DEL-classifier svm --INS-classifier svm --filter-bed $(GIAB_BED) | bgzip > $@
+	bcftools index -t $@
+
+npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG004.variant.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG004/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG002.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --DEL-gt-mode variant --INS-gt-mode variant --DEL-classifier rf --INS-classifier rf | bgzip > $@
+	bcftools index -t $@
+
+npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG004.hybrid.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_HG004/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG002.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 \
+		--DEL-gt-mode hybrid --DEL-classifier rf --DEL-hybrid-threshold $(HYBRID_SIZE) \
+		--INS-gt-mode hybrid --INS-classifier rf --INS-hybrid-threshold $(HYBRID_SIZE)| bgzip > $@
+	bcftools index -t $@
+
+
+# Overwrite sample name
+npsv_giab_combined_NA12878/NA12878.illumina-polaris-v2.0.genoytped.passing.HG002.sim.tsv : ../ceph-trio/npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.sim.tsv
+	awk 'BEGIN { OFS="\t"; } /^#/ { print; } ! /^#/ && ($$4 == "DEL" || $$4 == "INS") { $$5 = "HG002"; print; }' $< > $@
+
+npsv_giab_combined_NA12878/NA12878.illumina-polaris-v2.0.genoytped.passing.HG002.real.tsv : ../ceph-trio/npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.0.real.tsv ../ceph-trio/npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.1.real.tsv ../ceph-trio/npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.2.real.tsv
+	head -n 1 $< > $@
+	awk 'BEGIN { OFS="\t"; } ! /^#/ && ($$4 == "DEL" || $$4 == "INS") { $$5 = "HG002"; print; }' $^ >> $@
+
+# Use NA12878 simulated data as training data
+HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-sim.single.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_NA12878/NA12878.illumina-polaris-v2.0.genoytped.passing.HG002.sim.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --DEL-gt-mode single --DEL-classifier svm --INS-gt-mode single --INS-classifier svm --downsample 1 --filter-bed $(GIAB_BED) | bgzip > $@
+	bcftools index -t $@
+
+# Use NA12878 real data as training data
+HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-real.single.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz npsv_giab_combined_NA12878/NA12878.illumina-polaris-v2.0.genoytped.passing.HG002.real.tsv npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --DEL-gt-mode single --DEL-classifier svm --INS-gt-mode single --INS-classifier svm --downsample 1 --filter-bed $(GIAB_BED) | bgzip > $@
+	bcftools index -t $@
+
+# Construct trios
+
+ashkenazi-trio.%.vcf.gz : HG002.%.vcf.gz HG003.%.vcf.gz HG004.%.vcf.gz
+	bcftools merge -Oz -o $@ $^
+	bcftools index -t $@
+
+npsv_trios: \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.vcf.gz \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.vcf.gz \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.vcf.gz
+
+.PHONY: npsv_trios
+
+# Concordance
+
+# All truvari commands must be run with the truvari module activated (typically in a different shell
+# since it requires a different virtual environment).
+
+# This is the Truvari parameters used by DupHold
+define truvari_template =
+$(1)/summary.txt : $(2) $(3)
+	rm -rf $$(dir $$@)
+	truvari bench -f $(REFERENCE) -b $$(word 2,$$^) -c $$< -o $$(dir $$@) \
+  		--includebed $(GIAB_BED) \
+    	--sizemax 15000000 -s 50 -S 30 --pctsim=0 -r 20 -O 0.6 \
+    	--passonly --giabreport --bSample HG002 --cSample HG002
+endef
+
+define truvari_tier2_template =
+$(1)/summary.txt : $(2) $(3)
+	rm -rf $$(dir $$@)
+	truvari bench -f $(REFERENCE) -b $$(word 2,$$^) -c $$< -o $$(dir $$@) \
+  		--includebed $(GIAB_ALL_TIERS_BED) \
+    	--sizemax 15000000 -s 50 -S 30 --pctsim=0 -r 20 -O 0.6 \
+    	--passonly --giabreport --bSample HG002 --cSample HG002
+endef
+
+# This is the Truvari recommended parameters
+define truvari_discovery_template =
+$(1)/summary.txt : $(2) $(3)
+	rm -rf $$(dir $$@)
+	truvari bench -f $(REFERENCE) -b $$(word 2,$$^) -c $$< -o $$(dir $$@) \
+  		--includebed $(GIAB_BED) \
+    	--sizemax 15000000 -s 50 -S 30 --pctsim=0 --pctsize=0.7 -r 2000 \
+    	--passonly --giabreport --bSample HG002 --cSample HG002
+endef
+
+
+truvari_ALL_template = $(call truvari_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.vcf.gz)
+truvari_ALL_longreadhomref_template = $(call truvari_template, $(1), $(2:.vcf.gz=.longreadhomref.vcf.gz), HG002_SVs_Tier1_v0.6.genotyped.longreadhomref.vcf.gz)
+
+truvari_DEL_template = $(call truvari_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.DEL.vcf.gz)
+truvari_DEL_longreadhomref_template = $(call truvari_template, $(1), $(2:.vcf.gz=.longreadhomref.vcf.gz), HG002_SVs_Tier1_v0.6.genotyped.DEL.longreadhomref.vcf.gz)
+truvari_DEL_tier2_template = $(call truvari_tier2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.DEL.vcf.gz)
+truvari_DEL_longreadhomref_tier2_template = $(call truvari_tier2_template, $(1), $(2:.vcf.gz=.longreadhomref.vcf.gz), HG002_SVs_Tier1_v0.6.genotyped.DEL.longreadhomref.vcf.gz)
+
+truvari_INS_template = $(call truvari_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.INS.vcf.gz)
+truvari_INS_longreadhomref_template = $(call truvari_template, $(1), $(2:.vcf.gz=.longreadhomref.vcf.gz), HG002_SVs_Tier1_v0.6.genotyped.INS.longreadhomref.vcf.gz)
+truvari_INS_tier2_template = $(call truvari_tier2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.INS.vcf.gz)
+truvari_INS_longreadhomref_tier2_template = $(call truvari_tier2_template, $(1), $(2:.vcf.gz=.longreadhomref.vcf.gz), HG002_SVs_Tier1_v0.6.genotyped.INS.longreadhomref.vcf.gz)
+
+truvari_DEL_discovery_template = $(call truvari_discovery_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.DEL.vcf.gz)
+truvari_DEL_discovery_longreadhomref_template = $(call truvari_discovery_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.DEL.longreadhomref.vcf.gz)
+truvari_INS_discovery_template = $(call truvari_discovery_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.INS.vcf.gz)
+truvari_INS_discovery_longreadhomref_template = $(call truvari_discovery_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.INS.longreadhomref.vcf.gz)
+
+# Compute the number of Mendelian errors
+%.mendelian.txt : %.vcf.gz
+	bcftools view -t ^X,Y,MT $< | bcftools +mendelian /dev/stdin -r GRCh37 -t HG004,HG003,HG002 -c > $@
+
+%.tier1.mendelian.vcf.gz : %.vcf.gz
+	bcftools view -R $(GIAB_BED) $< | \
+		bcftools view -t ^X,Y,MT /dev/stdin | \
+		bcftools +mendelian -Oz -o $@  -r GRCh37 -t HG004,HG003,HG002 -lx /dev/stdin
+	bcftools index -t $@
+
+%.tier1.mendelian.txt : %.vcf.gz
+	bcftools view -R $(GIAB_BED) $< | \
+		bcftools view -t ^X,Y,MT /dev/stdin | \
+		bcftools +mendelian /dev/stdin -r GRCh37 -t HG004,HG003,HG002 -c > $@
+
+%.tier1and2.mendelian.vcf.gz : %.vcf.gz
+	bcftools view -R $(GIAB_ALL_TIERS_BED) $< | \
+		bcftools view -t ^X,Y,MT /dev/stdin | \
+		bcftools +mendelian -Oz -o $@  -r GRCh37 -t HG004,HG003,HG002 -lx /dev/stdin
+	bcftools index -t $@
+
+%.tier1and2.mendelian.txt : %.vcf.gz
+	bcftools view -R $(GIAB_ALL_TIERS_BED) $< | \
+		bcftools view -t ^X,Y,MT /dev/stdin | \
+		bcftools +mendelian /dev/stdin -r GRCh37 -t HG004,HG003,HG002 -c > $@
+
+%.mendelian.breakdown.csv : %.mendelian.vcf.gz
+	python3 $(NPSV_ROOT)/paper/mendelian_stats.py -t HG004,HG003,HG002 counts $< > $@
+
+%.mendelian.gq.csv : %.mendelian.vcf.gz
+	python3 $(NPSV_ROOT)/paper/mendelian_stats.py -t HG004,HG003,HG002 gq $< > $@
+
+%.mendelian.list.csv : %.mendelian.vcf.gz
+	python3 $(NPSV_ROOT)/paper/mendelian_stats.py -t HG004,HG003,HG002 list $< > $@
+
+%.tier1.gq.csv : %.vcf.gz
+	python3 ~/research/npsv/paper/mendelian_stats.py -t HG004,HG003,HG002 gq <(bcftools view -R HG002_SVs_Tier1_v0.6.bed $< | bcftools view -t ^X,Y,MT) > $@
+
+%.gq.csv : %/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py gq $< > $@
+
+%.list.gq.csv : %/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py list $< > $@
+
+%.tr.csv : %/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py vntr $< > $@
+
+%.tr-conc.csv : %/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py vntr-conc $< > $@
+
+%.len.csv : %/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py len $< > $@
+
+# All
+$(eval $(call truvari_ALL_template, truvari_npsv_single_ALL, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.vcf.gz))
+$(eval $(call truvari_ALL_longreadhomref_template, truvari_npsv_single_ALL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.vcf.gz))
+$(eval $(call truvari_ALL_template, truvari_npsv_variant_ALL, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.vcf.gz))
+$(eval $(call truvari_ALL_longreadhomref_template, truvari_npsv_variant_ALL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.vcf.gz))
+$(eval $(call truvari_ALL_template, truvari_npsv_hybrid_ALL, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.vcf.gz))
+$(eval $(call truvari_ALL_longreadhomref_template, truvari_npsv_hybrid_ALL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.vcf.gz))
+
+# Deletions
+$(eval $(call truvari_DEL_template, truvari_npsv_single_DEL, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_single_DEL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_npsv_single_DEL_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_npsv_single_DEL_longreadhomref_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.vcf.gz))
+
+$(eval $(call truvari_DEL_template, truvari_npsv_variant_DEL, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_variant_DEL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.vcf.gz)) 
+$(eval $(call truvari_DEL_tier2_template, truvari_npsv_variant_DEL_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_npsv_variant_DEL_longreadhomref_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.vcf.gz)) 
+
+$(eval $(call truvari_DEL_template, truvari_npsv_hybrid_DEL, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_hybrid_DEL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_npsv_hybrid_DEL_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_npsv_hybrid_DEL_longreadhomref_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.vcf.gz))
+
+# Insertions
+$(eval $(call truvari_INS_template, truvari_npsv_single_INS, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_single_INS_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_tier2_template, truvari_npsv_single_INS_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_tier2_template, truvari_npsv_single_INS_longreadhomref_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.vcf.gz))
+
+$(eval $(call truvari_INS_template, truvari_npsv_variant_INS, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_variant_INS_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_tier2_template, truvari_npsv_variant_INS_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_tier2_template, truvari_npsv_variant_INS_longreadhomref_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.vcf.gz)) 
+
+$(eval $(call truvari_INS_template, truvari_npsv_hybrid_INS, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_hybrid_INS_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_tier2_template, truvari_npsv_hybrid_INS_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_tier2_template, truvari_npsv_hybrid_INS_longreadhomref_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.vcf.gz))
+
+# Proposal
+$(eval $(call truvari_DEL_template, truvari_npsv_propose_variant_DEL, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_propose_variant_DEL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_npsv_propose_variant_DEL_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_npsv_propose_variant_DEL_longreadhomref_tier2, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.variant.npsv.DEL.vcf.gz))
+
+# Testing
+$(eval $(call truvari_DEL_template, truvari_npsv_test_single_DEL, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_test_single_DEL_longreadhomref, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_npsv_test_variant_DEL, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_test_variant_DEL_longreadhomref, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_npsv_test_hybrid_DEL, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_test_hybrid_DEL_longreadhomref, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.vcf.gz))
+
+$(eval $(call truvari_INS_template, truvari_npsv_test_single_INS, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_test_single_INS_longreadhomref, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_npsv_test_variant_INS, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_test_variant_INS_longreadhomref, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_npsv_test_hybrid_INS, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_test_hybrid_INS_longreadhomref, npsv_giab_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.vcf.gz))
+
+# Proposal Testing
+$(eval $(call truvari_DEL_template, truvari_npsv_test_propose_variant_DEL, npsv_giab_propose_DEL_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_test_propose_variant_DEL_longreadhomref, npsv_giab_propose_DEL_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_npsv_test_propose_variant_DEL_tier2, npsv_giab_propose_DEL_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_npsv_test_propose_variant_DEL_longreadhomref_tier2, npsv_giab_propose_DEL_test/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.propose.variant.npsv.DEL.vcf.gz))
+
+
+# Sort and index truvari true positives
+%/tp-call.vcf.gz : %/tp-call.vcf
+	bcftools sort -Oz -o $@ $<
+	bcftools index -t $@
+
+npsv_propose_not_original.vcf.gz : $(TEMPDIR)/truvari_npsv_propose_pervariant_rf.vcf.gz $(TEMPDIR)/truvari_npsv_original_pervariant_rf.vcf.gz
+	bcftools isec -Oz -o $@ -i 'INFO/MatchGT="TRUE"' -n~10 -w 1 $^
+	bcftools index -t $@ 
+
+npsv_original_not_propose.vcf.gz : $(TEMPDIR)/truvari_npsv_propose_pervariant_rf.vcf.gz $(TEMPDIR)/truvari_npsv_original_pervariant_rf.vcf.gz
+	bcftools isec -Oz -o $@ -i 'INFO/MatchGT="TRUE"' -n~01 -w 1 $^
+	bcftools index -t $@
+
+npsv_pv_vs_single.tsv : $(TEMPDIR)/truvari_npsv_single.vcf.gz $(TEMPDIR)/truvari_npsv_pervariant.vcf.gz
+	echo -e "CHROM\tPOS\tEND\tSVTYPE\tSVLEN\tBREAKSIMLEGNTH\tREPTYPE\tTRall\tTRgt100\tTRgt10k\tsegdup\tConcordant" > $@
+	bcftools isec -i 'INFO/MatchGT="TRUE"' -n=2 -w 1 $^  | bcftools query -f "%CHROM\t%POS\t%END\t%INFO/SVTYPE\t%INFO/SVLEN\t%INFO/BREAKSIMLENGTH\t%INFO/REPTYPE\t%INFO/TRall\t%INFO/TRgt100\t%INFO/TRgt10k\t%INFO/segdup\tBoth\n" - >> $@
+	bcftools isec -i 'INFO/MatchGT="TRUE"' -n~10 -w 1 $^ | bcftools query -f "%CHROM\t%POS\t%END\t%INFO/SVTYPE\t%INFO/SVLEN\t%INFO/BREAKSIMLENGTH\t%INFO/REPTYPE\t%INFO/TRall\t%INFO/TRgt100\t%INFO/TRgt10k\t%INFO/segdup\tSingle\n" - >> $@
+	bcftools isec -i 'INFO/MatchGT="TRUE"' -n~01 -w 2 $^ | bcftools query -f "%CHROM\t%POS\t%END\t%INFO/SVTYPE\t%INFO/SVLEN\t%INFO/BREAKSIMLENGTH\t%INFO/REPTYPE\t%INFO/TRall\t%INFO/TRgt100\t%INFO/TRgt10k\t%INFO/segdup\tPerVariant\n" - >> $@
+
+npsv_concordance: \
+	truvari_npsv_single_DEL/summary.txt \
+	truvari_npsv_single_DEL_longreadhomref/summary.txt \
+	truvari_npsv_single_DEL_tier2/summary.txt \
+	truvari_npsv_single_DEL_longreadhomref_tier2/summary.txt \
+	truvari_npsv_variant_DEL/summary.txt \
+	truvari_npsv_variant_DEL_longreadhomref/summary.txt \
+	truvari_npsv_variant_DEL_tier2/summary.txt \
+	truvari_npsv_variant_DEL_longreadhomref_tier2/summary.txt \
+	truvari_npsv_hybrid_DEL/summary.txt \
+	truvari_npsv_hybrid_DEL_longreadhomref/summary.txt \
+	truvari_npsv_hybrid_DEL_tier2/summary.txt \
+	truvari_npsv_hybrid_DEL_longreadhomref_tier2/summary.txt \
+	truvari_npsv_single_INS/summary.txt \
+	truvari_npsv_single_INS_longreadhomref/summary.txt \
+	truvari_npsv_single_INS_tier2/summary.txt \
+	truvari_npsv_single_INS_longreadhomref_tier2/summary.txt \
+	truvari_npsv_variant_INS/summary.txt \
+	truvari_npsv_variant_INS_longreadhomref/summary.txt \
+	truvari_npsv_variant_INS_tier2/summary.txt \
+	truvari_npsv_variant_INS_longreadhomref_tier2/summary.txt \
+	truvari_npsv_hybrid_INS/summary.txt \
+	truvari_npsv_hybrid_INS_longreadhomref/summary.txt \
+	truvari_npsv_hybrid_INS_tier2/summary.txt \
+	truvari_npsv_hybrid_INS_longreadhomref_tier2/summary.txt \
+	truvari_npsv_single_ALL/summary.txt \
+	truvari_npsv_single_ALL_longreadhomref/summary.txt \
+	truvari_npsv_variant_ALL/summary.txt \
+	truvari_npsv_variant_ALL_longreadhomref/summary.txt \
+	truvari_npsv_hybrid_ALL/summary.txt \
+	truvari_npsv_hybrid_ALL_longreadhomref/summary.txt \
+	truvari_npsv_propose_variant_DEL/summary.txt \
+	truvari_npsv_propose_variant_DEL_longreadhomref/summary.txt \
+	truvari_npsv_propose_variant_DEL_tier2/summary.txt \
+	truvari_npsv_propose_variant_DEL_longreadhomref_tier2/summary.txt \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.tier1.mendelian.txt \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.tier1.mendelian.gq.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.tier1.mendelian.breakdown.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.tier1.mendelian.list.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.tier1.mendelian.txt \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.tier1.mendelian.gq.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.tier1.mendelian.breakdown.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.tier1.mendelian.list.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.tier1.mendelian.txt \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.tier1.mendelian.gq.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.tier1.mendelian.breakdown.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.tier1.mendelian.list.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.tier1.mendelian.txt \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.tier1.mendelian.gq.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.tier1.mendelian.breakdown.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.tier1.mendelian.list.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.tier1.mendelian.txt \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.tier1.mendelian.gq.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.tier1.mendelian.breakdown.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.tier1.mendelian.list.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.tier1.mendelian.txt \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.tier1.mendelian.gq.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.tier1.mendelian.breakdown.csv \
+	ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.tier1.mendelian.list.csv \
+	truvari_npsv_single_DEL.gq.csv \
+	truvari_npsv_variant_DEL.gq.csv \
+	truvari_npsv_hybrid_DEL.gq.csv \
+	truvari_npsv_single_INS.gq.csv \
+	truvari_npsv_variant_INS.gq.csv \
+	truvari_npsv_hybrid_INS.gq.csv \
+	truvari_npsv_single_DEL_longreadhomref.gq.csv \
+	truvari_npsv_variant_DEL_longreadhomref.gq.csv \
+	truvari_npsv_hybrid_DEL_longreadhomref.gq.csv \
+	truvari_npsv_single_INS_longreadhomref.gq.csv \
+	truvari_npsv_variant_INS_longreadhomref.gq.csv \
+	truvari_npsv_hybrid_INS_longreadhomref.gq.csv \
+	truvari_npsv_single_DEL_longreadhomref.list.gq.csv \
+	truvari_npsv_variant_DEL_longreadhomref.list.gq.csv \
+	truvari_npsv_hybrid_DEL_longreadhomref.list.gq.csv \
+	truvari_npsv_single_INS_longreadhomref.list.gq.csv \
+	truvari_npsv_variant_INS_longreadhomref.list.gq.csv \
+	truvari_npsv_hybrid_INS_longreadhomref.list.gq.csv \
+	truvari_npsv_single_DEL.tr.csv \
+	truvari_npsv_variant_DEL.tr.csv \
+	truvari_npsv_hybrid_DEL.tr.csv \
+	truvari_npsv_single_INS.tr.csv \
+	truvari_npsv_variant_INS.tr.csv \
+	truvari_npsv_hybrid_INS.tr.csv \
+	truvari_npsv_single_DEL_longreadhomref.tr.csv \
+	truvari_npsv_variant_DEL_longreadhomref.tr.csv \
+	truvari_npsv_hybrid_DEL_longreadhomref.tr.csv \
+	truvari_npsv_single_INS_longreadhomref.tr.csv \
+	truvari_npsv_variant_INS_longreadhomref.tr.csv \
+	truvari_npsv_hybrid_INS_longreadhomref.tr.csv \
+	truvari_npsv_single_DEL.len.csv \
+	truvari_npsv_variant_DEL.len.csv \
+	truvari_npsv_hybrid_DEL.len.csv \
+	truvari_npsv_single_INS.len.csv \
+	truvari_npsv_variant_INS.len.csv \
+	truvari_npsv_hybrid_INS.len.csv \
+	truvari_npsv_single_DEL_longreadhomref.len.csv \
+	truvari_npsv_variant_DEL_longreadhomref.len.csv \
+	truvari_npsv_hybrid_DEL_longreadhomref.len.csv \
+	truvari_npsv_single_INS_longreadhomref.len.csv \
+	truvari_npsv_variant_INS_longreadhomref.len.csv \
+	truvari_npsv_hybrid_INS_longreadhomref.len.csv \
+	truvari_npsv_single_DEL.tr-conc.csv \
+	truvari_npsv_variant_DEL.tr-conc.csv \
+	truvari_npsv_hybrid_DEL.tr-conc.csv \
+	truvari_npsv_single_INS.tr-conc.csv \
+	truvari_npsv_variant_INS.tr-conc.csv \
+	truvari_npsv_hybrid_INS.tr-conc.csv \
+	truvari_npsv_single_DEL_longreadhomref.tr-conc.csv \
+	truvari_npsv_variant_DEL_longreadhomref.tr-conc.csv \
+	truvari_npsv_hybrid_DEL_longreadhomref.tr-conc.csv \
+	truvari_npsv_single_INS_longreadhomref.tr-conc.csv \
+	truvari_npsv_variant_INS_longreadhomref.tr-conc.csv \
+	truvari_npsv_hybrid_INS_longreadhomref.tr-conc.csv
+
+# Cross-sample concordnace
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_HG002_single_DEL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_HG002_variant_DEL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_HG002_hybrid_DEL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.DEL.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_HG002_single_INS_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_HG002_variant_INS_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.variant.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_HG002_hybrid_INS_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.hybrid.npsv.INS.vcf.gz))
+
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_HG003_single_DEL_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG003.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_HG003_variant_DEL_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG003.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_HG003_hybrid_DEL_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG003.hybrid.npsv.DEL.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_HG003_single_INS_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG003.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_HG003_variant_INS_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG003.variant.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_HG003_hybrid_INS_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG003.hybrid.npsv.INS.vcf.gz))
+
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_HG004_single_DEL_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG004.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_HG004_variant_DEL_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG004.variant.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_HG004_hybrid_DEL_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG004.hybrid.npsv.DEL.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_HG004_single_INS_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG004.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_HG004_variant_INS_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG004.variant.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_HG004_hybrid_INS_longreadhomref, npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.HG004.hybrid.npsv.INS.vcf.gz))
+
+$(eval $(call truvari_DEL_template, truvari_npsv_cross_NA12878_sim_single_DEL, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-sim.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_NA12878_sim_single_DEL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-sim.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_npsv_cross_NA12878_sim_single_INS, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-sim.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_NA12878_sim_single_INS_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-sim.single.npsv.INS.vcf.gz))
+
+$(eval $(call truvari_DEL_template, truvari_npsv_cross_NA12878_real_single_DEL, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-real.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_cross_NA12878_real_single_DEL_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-real.single.npsv.DEL.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_npsv_cross_NA12878_real_single_INS, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-real.single.npsv.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_npsv_cross_NA12878_real_single_INS_longreadhomref, HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878-real.single.npsv.INS.vcf.gz))
+
+cross_concordance : \
+	truvari_npsv_cross_HG002_single_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG002_variant_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG002_hybrid_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG002_single_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG002_variant_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG002_hybrid_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG003_single_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG003_variant_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG003_hybrid_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG003_single_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG003_variant_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG003_hybrid_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG004_single_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG004_variant_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG004_hybrid_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG004_single_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG004_variant_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_HG004_hybrid_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_NA12878_sim_single_DEL/summary.txt \
+	truvari_npsv_cross_NA12878_sim_single_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_NA12878_sim_single_INS/summary.txt \
+	truvari_npsv_cross_NA12878_sim_single_INS_longreadhomref/summary.txt \
+	truvari_npsv_cross_NA12878_real_single_DEL/summary.txt \
+	truvari_npsv_cross_NA12878_real_single_DEL_longreadhomref/summary.txt \
+	truvari_npsv_cross_NA12878_real_single_INS/summary.txt \
+	truvari_npsv_cross_NA12878_real_single_INS_longreadhomref/summary.txt
+
+# For manual review of discordant variants	
+truvari_npsv_variant_DEL.variants : truvari_npsv_variant_DEL
+	bcftools view -H -i 'INFO/MatchGT == "FALSE"' truvari_npsv_variant_DEL/tp-call.vcf | \
+		shuf -n 10 > $@
+
+# Comparison of different replicate numbers
+replicate.concordance.csv :
+	grep -h Downsample replicate_sweep-18151*.out | grep Concordance > $@
+
+replicate.MER.csv :
+	grep -h Downsample replicate_sweep-18151*.out | grep MER > $@
+
+
+# Comparison tools
+
+# svviz2
+
+svviz2_giab/%.report.tsv : giab_all_inputs/%.vcf.gz
+	mkdir -p $(dir $@)
+	svviz2 \
+		--ref $(REFERENCE) -o $(dir $@) --report-only \
+		--variants <(bcftools annotate --set-id +'%CHROM\_%POS\_%INFO/END' $<) \
+		$(BAM) $(MAT_BAM) $(PAT_BAM) 
+
+svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.vcf.gz
+	svviz22vcf --model count -i $< -r svviz2_giab \
+		-s $(notdir $(BAM:.bam=)) \
+		-s $(notdir $(PAT_BAM:.bam=)) \
+		-s $(notdir $(MAT_BAM:.bam=)) \
+		-o /dev/stdout | \
+		bcftools reheader -s <(echo -e "HG002\nHG003\nHG004") - | \
+		sed 's/\bnan\b/./g' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.vcf.gz
+	svviz22vcf --model mapq -i $< -r svviz2_giab \
+		-s $(notdir $(BAM:.bam=)) \
+		-s $(notdir $(PAT_BAM:.bam=)) \
+		-s $(notdir $(MAT_BAM:.bam=)) \
+		-o /dev/stdout | \
+		bcftools reheader -s <(echo -e "HG002\nHG003\nHG004") - | \
+		sed 's/\bnan\b/./g' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.vcf.gz
+	svviz22vcf --model weighted -i $< -r svviz2_giab \
+		-s $(notdir $(BAM:.bam=)) \
+		-s $(notdir $(PAT_BAM:.bam=)) \
+		-s $(notdir $(MAT_BAM:.bam=)) \
+		-o /dev/stdout | \
+		bcftools reheader -s <(echo -e "HG002\nHG003\nHG004") - | \
+		sed 's/\bnan\b/./g' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svviz2_giab/%.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.vcf.gz : svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+svviz2_giab/%.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.vcf.gz : svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+svviz2_giab/%.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.vcf.gz : svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+$(eval $(call truvari_DEL_template, truvari_svviz2_count_DEL, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_svviz2_mapq_DEL, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_svviz2_weighted_DEL, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.DEL.vcf.gz))
+
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_svviz2_count_DEL_longreadhomref, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_svviz2_mapq_DEL_longreadhomref, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_svviz2_weighted_DEL_longreadhomref, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.DEL.vcf.gz))
+
+$(eval $(call truvari_DEL_tier2_template, truvari_svviz2_count_DEL_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_svviz2_mapq_DEL_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_svviz2_weighted_DEL_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.DEL.vcf.gz))
+
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_svviz2_count_DEL_longreadhomref_tier2, ssvviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_svviz2_mapq_DEL_longreadhomref_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_svviz2_weighted_DEL_longreadhomref_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.DEL.vcf.gz))
+
+$(eval $(call truvari_INS_template, truvari_svviz2_count_INS, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_svviz2_mapq_INS, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_svviz2_weighted_INS, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.INS.vcf.gz))
+
+$(eval $(call truvari_INS_longreadhomref_template, truvari_svviz2_count_INS_longreadhomref, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_svviz2_mapq_INS_longreadhomref, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_svviz2_weighted_INS_longreadhomref, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.INS.vcf.gz))
+
+$(eval $(call truvari_INS_tier2_template, truvari_svviz2_count_INS_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.vcf.gz))
+$(eval $(call truvari_INS_tier2_template, truvari_svviz2_mapq_INS_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.vcf.gz))
+$(eval $(call truvari_INS_tier2_template, truvari_svviz2_weighted_INS_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.INS.vcf.gz))
+
+$(eval $(call truvari_INS_longreadhomref_tier2_template, truvari_svviz2_count_INS_longreadhomref_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_tier2_template, truvari_svviz2_mapq_INS_longreadhomref_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_tier2_template, truvari_svviz2_weighted_INS_longreadhomref_tier2, svviz2_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_weighted.INS.vcf.gz))
+
+svviz2_concordance: \
+	truvari_svviz2_count_DEL/summary.txt \
+	truvari_svviz2_mapq_DEL/summary.txt \
+	truvari_svviz2_weighted_DEL/summary.txt \
+	truvari_svviz2_count_DEL_longreadhomref/summary.txt \
+	truvari_svviz2_mapq_DEL_longreadhomref/summary.txt \
+	truvari_svviz2_weighted_DEL_longreadhomref/summary.txt \
+	truvari_svviz2_count_DEL_tier2/summary.txt \
+	truvari_svviz2_mapq_DEL_tier2/summary.txt \
+	truvari_svviz2_weighted_DEL_tier2/summary.txt \
+	truvari_svviz2_count_DEL_longreadhomref_tier2/summary.txt \
+	truvari_svviz2_mapq_DEL_longreadhomref_tier2/summary.txt \
+	truvari_svviz2_weighted_DEL_longreadhomref_tier2/summary.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.tier1.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.tier1and2.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.tier1.mendelian.vcf.gz \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.tier1.mendelian.breakdown.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.tier1.mendelian.gq.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.DEL.tier1.mendelian.list.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.tier1.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.tier1and2.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.tier1.mendelian.vcf.gz \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.tier1.mendelian.breakdown.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.tier1.mendelian.gq.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.DEL.tier1.mendelian.list.csv \
+	truvari_svviz2_count_INS/summary.txt \
+	truvari_svviz2_mapq_INS/summary.txt \
+	truvari_svviz2_weighted_INS/summary.txt \
+	truvari_svviz2_count_INS_longreadhomref/summary.txt \
+	truvari_svviz2_mapq_INS_longreadhomref/summary.txt \
+	truvari_svviz2_weighted_INS_longreadhomref/summary.txt \
+	truvari_svviz2_count_INS_tier2/summary.txt \
+	truvari_svviz2_mapq_INS_tier2/summary.txt \
+	truvari_svviz2_weighted_INS_tier2/summary.txt \
+	truvari_svviz2_count_INS_longreadhomref_tier2/summary.txt \
+	truvari_svviz2_mapq_INS_longreadhomref_tier2/summary.txt \
+	truvari_svviz2_weighted_INS_longreadhomref_tier2/summary.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.tier1.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.tier1and2.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.tier1.mendelian.vcf.gz \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.tier1.mendelian.breakdown.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.tier1.mendelian.gq.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_count.INS.tier1.mendelian.list.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.tier1.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.tier1and2.mendelian.txt \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.tier1.mendelian.vcf.gz \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.tier1.mendelian.breakdown.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.tier1.mendelian.gq.csv \
+	svviz2_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svviz2_mapq.INS.tier1.mendelian.list.csv \
+	truvari_svviz2_count_DEL.gq.csv \
+	truvari_svviz2_count_DEL_longreadhomref.gq.csv \
+	truvari_svviz2_count_INS.gq.csv \
+	truvari_svviz2_count_INS_longreadhomref.gq.csv \
+	truvari_svviz2_count_DEL.len.csv \
+	truvari_svviz2_count_DEL_longreadhomref.len.csv \
+	truvari_svviz2_count_INS.len.csv \
+	truvari_svviz2_count_INS_longreadhomref.len.csv \
+	truvari_svviz2_mapq_DEL.gq.csv \
+	truvari_svviz2_mapq_DEL_longreadhomref.gq.csv \
+	truvari_svviz2_mapq_INS.gq.csv \
+	truvari_svviz2_mapq_INS_longreadhomref.gq.csv \
+	truvari_svviz2_mapq_DEL_longreadhomref.list.gq.csv \
+	truvari_svviz2_mapq_INS_longreadhomref.list.gq.csv \
+	truvari_svviz2_mapq_DEL.len.csv \
+	truvari_svviz2_mapq_INS.len.csv \
+	truvari_svviz2_mapq_DEL_longreadhomref.len.csv \
+	truvari_svviz2_mapq_INS_longreadhomref.len.csv \
+	truvari_svviz2_mapq_DEL.tr-conc.csv \
+	truvari_svviz2_mapq_INS.tr-conc.csv \
+	truvari_svviz2_mapq_DEL_longreadhomref.tr-conc.csv \
+	truvari_svviz2_mapq_INS_longreadhomref.tr-conc.csv
+
+.PHONY: svviz2_concordance
+
+# SVTyper
+
+svtyper_giab/HG002.%.svtyper.vcf.gz : %.vcf.gz $(BAM)
+	mkdir -p $(dir $@)
+	svtyper -i <(bcftools view -G $<) -B $(BAM) -l $(notdir $(BAM)).json | \
+		sed 's/=""/="/' | \
+		bgzip -c > $@
+	bcftools index -t $@
+
+svtyper_giab/HG003.%.svtyper.vcf.gz : %.vcf.gz $(PAT_BAM)
+	mkdir -p $(dir $@)
+	svtyper -i <(bcftools view -G $<) -B $(PAT_BAM) -l $(notdir $(PAT_BAM)).json | \
+		sed 's/=""/="/' | \
+		bgzip -c > $@
+	bcftools index -t $@
+
+svtyper_giab/HG004.%.svtyper.vcf.gz : %.vcf.gz $(MAT_BAM)
+	mkdir -p $(dir $@)
+	svtyper -i <(bcftools view -G $<) -B $(MAT_BAM) -l $(notdir $(MAT_BAM)).json | \
+		sed 's/=""/="/' | \
+		bgzip -c > $@
+	bcftools index -t $@
+
+svtyper_giab/ashkenazi-trio.%.svtyper.vcf.gz : %.vcf.gz
+	mkdir -p $(dir $@)
+	svtyper -i <(bcftools view -G $<) -B $(BAM),$(PAT_BAM),$(MAT_BAM) -l ashkenazi-trio.svtyper.json | \
+		sed 's/=""/="/' | \
+		bgzip -c > $@
+	bcftools index -t $@	
+
+$(eval $(call truvari_DEL_template, truvari_svtyper_DEL, svtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_svtyper_DEL_longreadhomref, svtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_svtyper_DEL_tier2, svtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_svtyper_DEL_longreadhomref_tier2, svtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.vcf.gz))
+
+$(eval $(call truvari_INS_template, truvari_svtyper_INS, svtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_svtyper_INS_longreadhomref, svtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.INS.vcf.gz))
+$(eval $(call truvari_INS_tier2_template, truvari_svtyper_INS_tier2, svtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.INS.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_tier2_template, truvari_svtyper_INS_longreadhomref_tier2, svtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.INS.vcf.gz))
+
+svtyper_concordance: \
+	truvari_svtyper_DEL/summary.txt \
+	truvari_svtyper_DEL_longreadhomref/summary.txt \
+	truvari_svtyper_DEL_tier2/summary.txt \
+	truvari_svtyper_DEL_longreadhomref_tier2/summary.txt \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.mendelian.txt \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.tier1.mendelian.txt \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.tier1and2.mendelian.txt \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.tier1.mendelian.breakdown.csv \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.tier1.mendelian.gq.csv \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.DEL.tier1.mendelian.list.csv \
+	truvari_svtyper_INS/summary.txt \
+	truvari_svtyper_INS_longreadhomref/summary.txt \
+	truvari_svtyper_INS_tier2/summary.txt \
+	truvari_svtyper_INS_longreadhomref_tier2/summary.txt \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.INS.mendelian.txt \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.INS.tier1.mendelian.txt \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.INS.tier1and2.mendelian.txt \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.INS.tier1.mendelian.breakdown.csv \
+	svtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.svtyper.INS.tier1.mendelian.gq.csv \
+	truvari_svtyper_DEL.gq.csv \
+	truvari_svtyper_DEL_longreadhomref.gq.csv \
+	truvari_svtyper_DEL_longreadhomref.list.gq.csv \
+	truvari_svtyper_DEL.len.csv \
+	truvari_svtyper_DEL_longreadhomref.len.csv
+
+.PHONY: svtyper_concordance
+
+# Paragraph
+
+paragraph_giab/HG002_SVs_Tier1_v0.6.paragraph.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.vcf.gz
+	padAlleles -r $(REFERENCE) -i $< | bcftools sort -Oz -o $@
+	bcftools index -t $@
+
+paragraph_giab/genotypes.vcf.gz : paragraph_giab/HG002_SVs_Tier1_v0.6.paragraph.vcf.gz samples.txt
+	multigrmpy.py \
+		--scratch-dir $(TEMPDIR) -t $(THREADS) \
+		-i $< \
+		-m samples.txt \
+		-r $(REFERENCE) \
+		-o $(dir $@)
+	bcftools index -t $@
+
+# Need to set ploidy to 2 for truvari comparison with GIAB
+paragraph_giab/%.HG002_SVs_Tier1_v0.6.paragraph.vcf.gz : paragraph_giab/genotypes.vcf.gz
+	bcftools +fixploidy $< -- -f 2 | bcftools view -s $* -Oz -o $@ -
+	bcftools index -t $@
+
+$(eval $(call truvari_DEL_template, truvari_paragraph_DEL, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_paragraph_DEL_nofilt, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.DEL.nofilt.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_paragraph_DEL_longreadhomref, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_paragraph_DEL_longreadhomref_nofilt, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.DEL.nofilt.vcf.gz, HG002_SVs_Tier1_v0.6.DEL.genotyped.longreadhomref.vcf.gz))
+
+$(eval $(call truvari_DEL_tier2_template, truvari_paragraph_DEL_tier2, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_paragraph_DEL_nofilt_tier2, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.DEL.nofilt.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_paragraph_DEL_longreadhomref_tier2, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.DEL.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_paragraph_DEL_longreadhomref_nofilt_tier2, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.DEL.nofilt.vcf.gz, HG002_SVs_Tier1_v0.6.DEL.genotyped.longreadhomref.vcf.gz))
+
+$(eval $(call truvari_INS_template, truvari_paragraph_INS, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.INS.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_paragraph_INS_nofilt, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.INS.nofilt.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_template, truvari_paragraph_INS_longreadhomref, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.INS.vcf.gz))
+$(eval $(call truvari_template, truvari_paragraph_INS_longreadhomref_nofilt, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.INS.nofilt.vcf.gz, HG002_SVs_Tier1_v0.6.INS.genotyped.longreadhomref.vcf.gz))
+
+$(eval $(call truvari_INS_tier2_template, truvari_paragraph_INS_tier2, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.INS.vcf.gz))
+$(eval $(call truvari_INS_tier2_template, truvari_paragraph_INS_nofilt_tier2, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.INS.nofilt.vcf.gz))
+$(eval $(call truvari_INS_longreadhomref_tier2_template, truvari_paragraph_INS_longreadhomref_tier2, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.INS.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_paragraph_INS_longreadhomref_nofilt_tier2, paragraph_giab/HG002.HG002_SVs_Tier1_v0.6.paragraph.INS.nofilt.vcf.gz, HG002_SVs_Tier1_v0.6.INS.genotyped.longreadhomref.vcf.gz))
+
+
+paragraph_concordance: \
+	truvari_paragraph_DEL/summary.txt \
+	truvari_paragraph_DEL_nofilt/summary.txt \
+	truvari_paragraph_DEL_longreadhomref/summary.txt \
+	truvari_paragraph_DEL_longreadhomref_nofilt/summary.txt \
+	truvari_paragraph_DEL_tier2/summary.txt \
+	truvari_paragraph_DEL_nofilt_tier2/summary.txt \
+	truvari_paragraph_DEL_longreadhomref_tier2/summary.txt \
+	truvari_paragraph_DEL_longreadhomref_nofilt_tier2/summary.txt \
+	paragraph_giab/genotypes.DEL.mendelian.txt \
+	paragraph_giab/genotypes.DEL.tier1.mendelian.txt \
+	paragraph_giab/genotypes.DEL.tier1and2.mendelian.txt \
+	paragraph_giab/genotypes.DEL.tier1.mendelian.breakdown.csv \
+	paragraph_giab/genotypes.DEL.tier1.mendelian.gq.csv \
+	paragraph_giab/genotypes.DEL.tier1.mendelian.list.csv \
+	truvari_paragraph_INS/summary.txt \
+	truvari_paragraph_INS_nofilt/summary.txt \
+	truvari_paragraph_INS_longreadhomref/summary.txt \
+	truvari_paragraph_INS_longreadhomref_nofilt/summary.txt \
+	truvari_paragraph_INS_tier2/summary.txt \
+	truvari_paragraph_INS_nofilt_tier2/summary.txt \
+	truvari_paragraph_INS_longreadhomref_tier2/summary.txt \
+	truvari_paragraph_INS_longreadhomref_nofilt_tier2/summary.txt \
+	paragraph_giab/genotypes.INS.mendelian.txt \
+	paragraph_giab/genotypes.INS.tier1.mendelian.txt \
+	paragraph_giab/genotypes.INS.tier1and2.mendelian.txt \
+	paragraph_giab/genotypes.INS.tier1.mendelian.breakdown.csv \
+	paragraph_giab/genotypes.INS.tier1.mendelian.gq.csv \
+	paragraph_giab/genotypes.INS.tier1.mendelian.list.csv \
+	truvari_paragraph_DEL_nofilt.gq.csv \
+	truvari_paragraph_DEL_longreadhomref_nofilt.gq.csv \
+	truvari_paragraph_DEL_longreadhomref_nofilt.list.gq.csv \
+	truvari_paragraph_DEL.gq.csv \
+	truvari_paragraph_DEL_longreadhomref.gq.csv \
+	truvari_paragraph_INS_nofilt.gq.csv \
+	truvari_paragraph_INS_longreadhomref_nofilt.gq.csv \
+	truvari_paragraph_INS_longreadhomref_nofilt.list.gq.csv \
+	truvari_paragraph_INS.gq.csv \
+	truvari_paragraph_INS_longreadhomref.gq.csv \
+	truvari_paragraph_DEL_nofilt.len.csv \
+	truvari_paragraph_DEL_longreadhomref_nofilt.len.csv \
+	truvari_paragraph_DEL.len.csv \
+	truvari_paragraph_DEL_longreadhomref.len.csv \
+	truvari_paragraph_INS_nofilt.len.csv \
+	truvari_paragraph_INS_longreadhomref_nofilt.len.csv \
+	truvari_paragraph_INS.len.csv \
+	truvari_paragraph_INS_longreadhomref.len.csv
+	truvari_paragraph_DEL_nofilt.tr-conc.csv \
+	truvari_paragraph_DEL_longreadhomref_nofilt.tr-conc.csv \
+	truvari_paragraph_INS_nofilt.tr-conc.csv \
+	truvari_paragraph_INS_longreadhomref_nofilt.tr-conc.csv
+
+.PHONY: paragraph_concordance
+
+# SV2
+
+sv2_genotypes/ashkenazi-sv2.HG002_SVs_Tier1_v0.6.genotyped.passing.vcf : HG002_SVs_Tier1_v0.6.genotyped.vcf.gz
+	sv2 -M -i $(BAM) -v $< -snv $(SNV) -p $(PED) -o HG002.HG002_SVs_Tier1_v0.6.genotyped.passing
+	sv2 -M -i $(PAT_BAM) -v $< -snv $(SNV) -p $(PED) -o HG003.HG002_SVs_Tier1_v0.6.genotyped.passing
+	sv2 -M -i $(MAT_BAM) -v $< -snv $(SNV) -p $(PED) -o HG004.HG002_SVs_Tier1_v0.6.genotyped.passing
+	sv2 -feats sv2_features -v $< -p $(PED) -o $(basename $(notdir $@))
+
+# Fix up VCF (e.g. removing problematic INFO entries and set ploidy to 2) to facilitate Truvari comparison
+sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.vcf.gz : sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.vcf
+	sed '/^#/b; s/NA/./g' $< | sed 's/\(^##FILTER=<ID=GAP\)>/\1,Description="Missing description">/' | bcftools +fixploidy -- -f 2 - | bcftools norm -f $(REFERENCE) -c s - | bcftools annotate -x INFO/GENES -Oz -o $@ -
+	bcftools index -t $@
+
+sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.vcf.gz : sv2_genotypes/ashkenazi-sv2.HG002_SVs_Tier1_v0.6.genotyped.passing.vcf
+	sed '/^#/b; s/NA/./g' $< | sed 's/\(^##FILTER=<ID=GAP\)>/\1,Description="Missing description">/' | bcftools +fixploidy -- -f 2 - | bcftools norm -f $(REFERENCE) -c s - | bcftools annotate -x INFO/GENES -Oz -o $@ -
+	bcftools index -t $@
+
+# sv2 converts complex alleles to symbolic so pctsize can get thrown-off
+define truvari_sv2_template =
+$(1)/summary.txt : $(2) $(3)
+	rm -rf $$(dir $$@)
+	truvari bench -f $(REFERENCE) -b $$(word 2,$$^) -c $$< -o $$(dir $$@) \
+  	--includebed $(GIAB_BED) \
+    --sizemax 15000000 -s 50 -S 30 --pctsim=0 --pctsize=0 -r 20 -O 0.6 \
+    --passonly --giabreport --bSample HG002 --cSample HG002
+endef
+
+define truvari_sv2_tier2_template =
+$(1)/summary.txt : $(2) $(3)
+	rm -rf $$(dir $$@)
+	truvari bench -f $(REFERENCE) -b $$(word 2,$$^) -c $$< -o $$(dir $$@) \
+  	--includebed $(GIAB_ALL_TIERS_BED) \
+    --sizemax 15000000 -s 50 -S 30 --pctsim=0 --pctsize=0 -r 20 -O 0.6 \
+    --passonly --giabreport --bSample HG002 --cSample HG002
+endef
+
+truvari_sv2_DEL_template = $(call truvari_sv2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.DEL.vcf.gz)
+truvari_sv2_DEL_longreadhomref_template = $(call truvari_sv2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.DEL.longreadhomref.vcf.gz)
+truvari_sv2_DEL_tier2_template = $(call truvari_sv2_tier2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.DEL.vcf.gz)
+truvari_sv2_DEL_longreadhomref_tier2_template = $(call truvari_sv2_tier2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.genotyped.DEL.longreadhomref.vcf.gz)
+truvari_sv2_INS_template = $(call truvari_sv2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.INS.genotyped.vcf.gz)
+truvari_sv2_INS_longreadhomref_template = $(call truvari_sv2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.INS.genotyped.longreadhomref.vcf.gz)
+truvari_sv2_INS_tier2_template = $(call truvari_sv2_tier2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.INS.genotyped.vcf.gz)
+truvari_sv2_INS_longreadhomref_tier2_template = $(call truvari_sv2_tier2_template, $(1), $(2), HG002_SVs_Tier1_v0.6.INS.genotyped.longreadhomref.vcf.gz)
+
+# SV2 introduces its own filters, so LongReadHomRef is no longer present
+$(eval $(call truvari_sv2_DEL_template, truvari_sv2_DEL, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.vcf.gz))
+$(eval $(call truvari_sv2_DEL_template, truvari_sv2_DEL_nofilt, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.nofilt.vcf.gz))
+$(eval $(call truvari_sv2_DEL_longreadhomref_template, truvari_sv2_DEL_longreadhomref, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.vcf.gz))
+$(eval $(call truvari_sv2_DEL_longreadhomref_template, truvari_sv2_DEL_longreadhomref_nofilt, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.nofilt.vcf.gz))
+
+$(eval $(call truvari_sv2_DEL_tier2_template, truvari_sv2_DEL_tier2, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.vcf.gz))
+$(eval $(call truvari_sv2_DEL_tier2_template, truvari_sv2_DEL_nofilt_tier2, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.nofilt.vcf.gz))
+$(eval $(call truvari_sv2_DEL_longreadhomref_tier2_template, truvari_sv2_DEL_longreadhomref_tier2, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.vcf.gz))
+$(eval $(call truvari_sv2_DEL_longreadhomref_tier2_template, truvari_sv2_DEL_longreadhomref_nofilt_tier2, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.nofilt.vcf.gz))
+
+$(eval $(call truvari_sv2_INS_template, truvari_sv2_INS,  sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.vcf.gz))
+$(eval $(call truvari_sv2_INS_template, truvari_sv2_INS_nofilt, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.nofilt.vcf.gz))
+$(eval $(call truvari_sv2_INS_longreadhomref_template, truvari_sv2_INS_longreadhomref, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.vcf.gz))
+$(eval $(call truvari_sv2_INS_longreadhomref_template, truvari_sv2_INS_longreadhomref_nofilt, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.nofilt.vcf.gz))
+
+$(eval $(call truvari_sv2_INS_tier2_template, truvari_sv2_INS_tier2,  sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.vcf.gz))
+$(eval $(call truvari_sv2_INS_tier2_template, truvari_sv2_INS_nofilt_tier2, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.nofilt.vcf.gz))
+$(eval $(call truvari_sv2_INS_longreadhomref_tier2_template, truvari_sv2_INS_longreadhomref_tier2, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.vcf.gz))
+$(eval $(call truvari_sv2_INS_longreadhomref_tier2_template, truvari_sv2_INS_longreadhomref_nofilt_tier2, sv2_genotypes/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.nofilt.vcf.gz))
+
+sv2_concordance: \
+	truvari_sv2_DEL/summary.txt \
+	truvari_sv2_DEL_nofilt/summary.txt \
+	truvari_sv2_DEL_longreadhomref/summary.txt \
+	truvari_sv2_DEL_longreadhomref_nofilt/summary.txt \
+	truvari_sv2_DEL_tier2/summary.txt \
+	truvari_sv2_DEL_nofilt_tier2/summary.txt \
+	truvari_sv2_DEL_longreadhomref_tier2/summary.txt \
+	truvari_sv2_DEL_longreadhomref_nofilt_tier2/summary.txt \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.mendelian.txt \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.tier1.mendelian.txt \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.tier1and2.mendelian.txt \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.tier1.mendelian.breakdown.csv \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.tier1.mendelian.gq.csv \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.DEL.tier1.mendelian.list.csv \
+	truvari_sv2_INS/summary.txt \
+	truvari_sv2_INS_nofilt/summary.txt \
+	truvari_sv2_INS_longreadhomref/summary.txt \
+	truvari_sv2_INS_longreadhomref_nofilt/summary.txt \
+	truvari_sv2_INS_tier2/summary.txt \
+	truvari_sv2_INS_nofilt_tier2/summary.txt \
+	truvari_sv2_INS_longreadhomref_tier2/summary.txt \
+	truvari_sv2_INS_longreadhomref_nofilt_tier2/summary.txt \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.mendelian.txt \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.tier1.mendelian.txt \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.tier1and2.mendelian.txt \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.tier1.mendelian.breakdown.csv \
+	sv2_genotypes/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.sv2.INS.tier1.mendelian.gq.csv \
+	truvari_sv2_DEL_nofilt.gq.csv \
+	truvari_sv2_DEL_longreadhomref_nofilt.gq.csv \
+	truvari_sv2_DEL_longreadhomref_nofilt.list.gq.csv \
+	truvari_sv2_DEL_nofilt.len.csv \
+	truvari_sv2_DEL_longreadhomref_nofilt.len.csv
+
+.PHONY: sv2_concordance
+
+# Delly genotyping
+
+delly_giab/HG002_SVs_Tier1_v0.6.genotyped.passing.bcf : HG002_SVs_Tier1_v0.6.genotyped.passing.vcf.gz
+	bcftools view -Ob -o $@ $<
+	bcftools index -c $@
+
+delly_giab/HG002.%.delly.bcf : delly_giab/%.bcf
+	delly call -g $(REFERENCE) -v $< -o $@ -x $(DELLY_HOME)/excludeTemplates/human.hg19.excl.tsv $(BAM)
+
+delly_giab/HG003.%.delly.bcf : delly_giab/%.bcf
+	delly call -g $(REFERENCE) -v $< -o $@ -x $(DELLY_HOME)/excludeTemplates/human.hg19.excl.tsv $(PAT_BAM)
+
+delly_giab/HG004.%.delly.bcf : delly_giab/%.bcf
+	delly call -g $(REFERENCE) -v $< -o $@ -x $(DELLY_HOME)/excludeTemplates/human.hg19.excl.tsv $(MAT_BAM)
+
+delly_giab/ashkenazi-trio.%.delly.bcf : delly_giab/HG002.%.delly.bcf delly_giab/HG003.%.delly.bcf delly_giab/HG004.%.delly.bcf
+	bcftools merge -m id -Ob -o $@ $^
+	bcftools index -c $@ 
+
+# Unfortunately this drops sites instead of setting the FILTER columns
+delly_giab/ashkenazi-trio.%.filter.delly.bcf : delly_giab/ashkenazi-trio.%.delly.bcf
+	delly filter -f germline -o $@ $<
+
+delly_giab/%.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.filter.vcf.gz : delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.filter.delly.bcf
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+delly_giab/%.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.nofilt.vcf.gz : delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.bcf
+	bcftools annotate -x "FILTER" $< | bcftools view -s $* -Oz -o $@ -
+	bcftools index -t $@
+
+delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.DEL.vcf.gz : delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.bcf
+	bcftools view -Oz -o $@ -i '(SVTYPE ~ "^DEL")' $<
+	bcftools index -t $@	
+
+delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.INS.vcf.gz : delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.bcf
+	bcftools view -Oz -o $@ -i '(SVTYPE ~ "^INS")' $<
+	bcftools index -t $@
+
+# Delly introduces its own filters, so we pass the original file through (we will get an error trying to strip out LongReadHomRef filter)
+$(eval $(call truvari_DEL_template, truvari_delly_DEL, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.filter.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_delly_DEL_nofilt, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.nofilt.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_delly_DEL_longreadhomref, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.filter.DEL.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.longreadhomref.vcf.gz))
+$(eval $(call truvari_template, truvari_delly_DEL_longreadhomref_nofilt, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.nofilt.DEL.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.longreadhomref.vcf.gz))
+
+$(eval $(call truvari_DEL_tier2_template, truvari_delly_DEL_tier2, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.filter.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_delly_DEL_nofilt_tier2, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.nofilt.DEL.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_delly_DEL_longreadhomref_tier2, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.filter.DEL.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.longreadhomref.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_delly_DEL_longreadhomref_nofilt_tier2, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.nofilt.DEL.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.longreadhomref.vcf.gz))
+
+$(eval $(call truvari_INS_template, truvari_delly_INS, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.filter.INS.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_delly_INS_nofilt, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.nofilt.INS.vcf.gz))
+$(eval $(call truvari_template, truvari_delly_INS_longreadhomref, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.filter.INS.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.passing.INS.longreadhomref.vcf.gz))
+$(eval $(call truvari_template, truvari_delly_INS_longreadhomref_nofilt, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.nofilt.INS.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.passing.INS.longreadhomref.vcf.gz))
+
+$(eval $(call truvari_INS_tier2_template, truvari_delly_INS_tier2, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.filter.INS.vcf.gz))
+$(eval $(call truvari_INS_tier2_template, truvari_delly_INS_nofilt_tier2, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.nofilt.INS.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_delly_INS_longreadhomref_tier2, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.filter.INS.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.passing.INS.longreadhomref.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_delly_INS_longreadhomref_nofilt_tier2, delly_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.nofilt.INS.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.passing.INS.longreadhomref.vcf.gz))
+
+truvari_delly_DEL%.len.csv : truvari_delly_DEL%/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py len <(fixSVVCF -i $<) > $@
+
+truvari_delly_DEL%.len.csv : truvari_delly_DEL%/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py len <(fixSVVCF -i $<) > $@
+
+truvari_delly_DEL%.gq.csv : truvari_delly_DEL%/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py gq <(fixSVVCF -i $<) > $@
+
+truvari_delly_DEL%.list.gq.csv : truvari_delly_DEL%/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py list <(fixSVVCF -i $<) > $@
+
+delly_concordance: \
+	truvari_delly_DEL/summary.txt \
+	truvari_delly_DEL_nofilt/summary.txt \
+	truvari_delly_DEL_longreadhomref/summary.txt \
+	truvari_delly_DEL_longreadhomref_nofilt/summary.txt \
+	truvari_delly_DEL_tier2/summary.txt \
+	truvari_delly_DEL_nofilt_tier2/summary.txt \
+	truvari_delly_DEL_longreadhomref_tier2/summary.txt \
+	truvari_delly_DEL_longreadhomref_nofilt_tier2/summary.txt \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.DEL.mendelian.txt \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.DEL.tier1.mendelian.txt \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.DEL.tier1and2.mendelian.txt \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.DEL.tier1.mendelian.breakdown.csv \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.DEL.tier1.mendelian.gq.csv \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.DEL.tier1.mendelian.list.csv \
+	truvari_delly_INS/summary.txt \
+	truvari_delly_INS_nofilt/summary.txt \
+	truvari_delly_INS_longreadhomref/summary.txt \
+	truvari_delly_INS_longreadhomref_nofilt/summary.txt \
+	truvari_delly_INS_tier2/summary.txt \
+	truvari_delly_INS_nofilt_tier2/summary.txt \
+	truvari_delly_INS_longreadhomref_tier2/summary.txt \
+	truvari_delly_INS_longreadhomref_nofilt_tier2/summary.txt \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.INS.mendelian.txt \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.INS.tier1.mendelian.txt \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.INS.tier1and2.mendelian.txt \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.INS.tier1.mendelian.breakdown.csv \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.INS.tier1.mendelian.gq.csv \
+	delly_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.delly.INS.tier1.mendelian.list.csv \
+	truvari_delly_DEL_nofilt.gq.csv \
+	truvari_delly_DEL_longreadhomref_nofilt.gq.csv \
+	truvari_delly_DEL_longreadhomref_nofilt.list.gq.csv \
+	truvari_delly_INS_nofilt.gq.csv \
+	truvari_delly_INS_longreadhomref_nofilt.gq.csv \
+	truvari_delly_INS_longreadhomref_nofilt.list.gq.csv \
+	truvari_delly_DEL_nofilt.len.csv \
+	truvari_delly_DEL_longreadhomref_nofilt.len.csv \
+	truvari_delly_INS_nofilt.len.csv \
+	truvari_delly_INS_longreadhomref_nofilt.len.csv
+	
+
+.PHONY: delly_concordance
+
+# GenomeSTRiP genotyping
+
+SV_METADATA_DIR ?= /storage/mlinderman/ngs/resources/genomestrip/1000G_phase1
+
+genomestrip_preprocessing: 
+	java -Xmx4g -cp $(CLASSPATH) \
+		-Djava.io.tmpdir=$(TEMPDIR) \
+		org.broadinstitute.gatk.queue.QCommandLine \
+		-S $(SV_DIR)/qscript/SVPreprocess.q \
+		-S $(SV_DIR)/qscript/SVQScript.q \
+		-cp $(CLASSPATH) \
+		-gatk $(SV_DIR)/lib/gatk/GenomeAnalysisTK.jar \
+		-configFile $(SV_DIR)/conf/genstrip_parameters.txt \
+		-ploidyMapFile $(SV_METADATA_DIR)/human_g1k_v37.ploidymap.txt \
+		-R $(REFERENCE) \
+		-I /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG002/HG002-ready-withLB.bam \
+		-I /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG003/HG003-ready-withLB.bam \
+		-I /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG004/HG004-ready-withLB.bam \
+		-md $@ \
+		-bamFilesAreDisjoint true \
+		-jobLogDir genomestrip_log \
+		-jobRunner ParallelShell -maxConcurrentRun $(THREADS) \
+		-run
+
+genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.vcf.gz
+	mkdir -p $(dir $@)
+	java -Xmx4g -cp $(CLASSPATH) \
+		-Djava.io.tmpdir=$(TEMPDIR) \
+    	org.broadinstitute.gatk.queue.QCommandLine \
+    	-S $(SV_DIR)/qscript/SVGenotyper.q \
+    	-S $(SV_DIR)/qscript/SVQScript.q \
+		-cp $(CLASSPATH) \
+		-gatk $(SV_DIR)/lib/gatk/GenomeAnalysisTK.jar \
+		-configFile $(SV_DIR)/conf/genstrip_parameters.txt \
+		-rmd $(SV_METADATA_DIR) \
+		-R $(REFERENCE) \
+		-genomeMaskFile $(SV_METADATA_DIR)/human_g1k_v37.svmask.fasta \
+		-genderMapFile genomestrip.gender.txt \
+		-ploidyMapFile $(SV_METADATA_DIR)/human_g1k_v37.ploidymap.txt \
+		-md genomestrip_preprocessing \
+		-runDirectory $(dir $@) \
+		-vcf $< \
+		-I /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG002/HG002-ready-withLB.bam \
+		-I /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG003/HG003-ready-withLB.bam \
+		-I /storage/mlinderman/ngs/resources/ashkenazi-trio/final/HG004/HG004-ready-withLB.bam \
+		-O $@ \
+		-bamFilesAreDisjoint true \
+		-jobLogDir genomestrip_log \
+		-jobRunner ParallelShell -maxConcurrentRun $(THREADS) \
+		-run
+
+.PHONY: genomestrip_preprocessing
+
+# Remove FORMAT field that seems to be causing bcftools parsing errors
+genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.clean.vcf.gz : genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.vcf.gz
+	gzip -dc $< | sed 's/:NA:/:.:/g' | bcftools annotate -Oz -o $@ -x FORMAT/CNF -
+	bcftools index -t $@
+
+genomestrip_giab/%.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.vcf.gz : genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.clean.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.DEL.vcf.gz : genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.clean.vcf.gz
+	cp $< $@
+	bcftools index -t $@
+
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_genomestrip_DEL_longreadhomref, genomestrip_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_tier2_template, truvari_genomestrip_DEL_longreadhomref_tier2, genomestrip_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.vcf.gz))
+
+
+genomestrip_concordance: \
+	truvari_genomestrip_DEL_longreadhomref/summary.txt \
+	truvari_genomestrip_DEL_longreadhomref_tier2/summary.txt \
+	genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.DEL.tier1.mendelian.txt \
+	genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.DEL.tier1.mendelian.breakdown.csv \
+	genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.DEL.tier1.mendelian.gq.csv \
+	genomestrip_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.genomestrip.DEL.tier1.mendelian.list.csv \
+	truvari_genomestrip_DEL_longreadhomref.gq.csv \
+	truvari_genomestrip_DEL_longreadhomref.list.gq.csv \
+	truvari_genomestrip_DEL_longreadhomref.len.csv
+
+.PHONY: genomestrip_concordance
+
+# GraphTyper 2 (https://github.com/DecodeGenetics/graphtyper)
+
+graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.vcf.gz bams.txt
+	graphtyper genotype_sv $(REFERENCE) $< \
+		--output=$(dir $@) \
+		--sams=bams.txt \
+		--region_file=<(awk '{ print $$1 ":" $$2+1 "-" $$3; }' $(GIAB_ALL_TIERS_BED)) \
+		--force_no_copy_reference --threads=$(THREADS)
+	bcftools concat --naive $(dir $@)/**/*.vcf.gz | bcftools sort -Oz -o $@ -
+	bcftools index -t $@	 
+
+# Select the "AGGREGATED" model
+graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.vcf.gz : graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.vcf.gz
+	bcftools view -i '(SVTYPE ~ "^DEL" && INFO/SVMODEL=="AGGREGATED")' -Oz -o $@ $<
+	bcftools index -t $@
+
+graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.vcf.gz : graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.vcf.gz
+	bcftools view -i '((SVTYPE ~ "^INS" || SVTYPE ~ "^DUP") && INFO/SVMODEL=="AGGREGATED")' $< | sed '/^#/!s/DUP/INS/g' | bgzip -c > $@
+	bcftools index -t $@
+
+graphtyper_giab/%.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.vcf.gz : graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+graphtyper_giab/%.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.vcf.gz : graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+# GraphTyper introduces its own filters, so we pass the original file through (we will get an error trying to strip out LongReadHomRef filter)
+$(eval $(call truvari_DEL_template, truvari_graphtyper_DEL, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_graphtyper_DEL_nofilt, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.nofilt.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_DEL_longreadhomref, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.DEL.longreadhomref.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_DEL_longreadhomref_nofilt, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.nofilt.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.DEL.longreadhomref.vcf.gz))
+
+$(eval $(call truvari_DEL_tier2_template, truvari_graphtyper_DEL_tier2, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.vcf.gz))
+$(eval $(call truvari_DEL_tier2_template, truvari_graphtyper_DEL_nofilt_tier2, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.nofilt.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_graphtyper_DEL_longreadhomref_tier2, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.DEL.longreadhomref.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_graphtyper_DEL_longreadhomref_nofilt_tier2, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.nofilt.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.DEL.longreadhomref.vcf.gz))
+
+$(eval $(call truvari_INS_template, truvari_graphtyper_INS, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_graphtyper_INS_nofilt, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.nofilt.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_INS_longreadhomref, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.INS.longreadhomref.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_INS_longreadhomref_nofilt, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.nofilt.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.INS.longreadhomref.vcf.gz))
+
+$(eval $(call truvari_INS_tier2_template, truvari_graphtyper_INS_tier2, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.vcf.gz))
+$(eval $(call truvari_INS_tier2_template, truvari_graphtyper_INS_nofilt_tier2, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.nofilt.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_graphtyper_INS_longreadhomref_tier2, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.INS.longreadhomref.vcf.gz))
+$(eval $(call truvari_tier2_template, truvari_graphtyper_INS_longreadhomref_nofilt_tier2, graphtyper_giab/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.nofilt.vcf.gz, HG002_SVs_Tier1_v0.6.genotyped.INS.longreadhomref.vcf.gz))
+
+graphtyper_concordance: \
+	truvari_graphtyper_DEL/summary.txt \
+	truvari_graphtyper_DEL_nofilt/summary.txt \
+	truvari_graphtyper_DEL_longreadhomref/summary.txt \
+	truvari_graphtyper_DEL_longreadhomref_nofilt/summary.txt \
+	truvari_graphtyper_DEL_tier2/summary.txt \
+	truvari_graphtyper_DEL_nofilt_tier2/summary.txt \
+	truvari_graphtyper_DEL_longreadhomref_tier2/summary.txt \
+	truvari_graphtyper_DEL_longreadhomref_nofilt_tier2/summary.txt \
+	truvari_graphtyper_INS/summary.txt \
+	truvari_graphtyper_INS_nofilt/summary.txt \
+	truvari_graphtyper_INS_longreadhomref/summary.txt \
+	truvari_graphtyper_INS_longreadhomref_nofilt/summary.txt \
+	truvari_graphtyper_INS_tier2/summary.txt \
+	truvari_graphtyper_INS_nofilt_tier2/summary.txt \
+	truvari_graphtyper_INS_longreadhomref_tier2/summary.txt \
+	truvari_graphtyper_INS_longreadhomref_nofilt_tier2/summary.txt \
+	graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.tier1.mendelian.txt \
+	graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.tier1.mendelian.txt \
+	graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.tier1.mendelian.breakdown.csv \
+	graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.tier1.mendelian.breakdown.csv \
+	graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.tier1.mendelian.gq.csv \
+	graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.tier1.mendelian.gq.csv \
+	graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.DEL.tier1.mendelian.list.csv \
+	graphtyper_giab/ashkenazi-trio.HG002_SVs_Tier1_v0.6.genotyped.passing.graphtyper.INS.tier1.mendelian.list.csv \
+	truvari_graphtyper_DEL_nofilt.gq.csv \
+	truvari_graphtyper_DEL_longreadhomref_nofilt.gq.csv \
+	truvari_graphtyper_DEL_longreadhomref_nofilt.list.gq.csv \
+	truvari_graphtyper_INS_nofilt.gq.csv \
+	truvari_graphtyper_INS_longreadhomref_nofilt.gq.csv \
+	truvari_graphtyper_INS_longreadhomref_nofilt.list.gq.csv \
+	truvari_graphtyper_DEL_nofilt.len.csv \
+	truvari_graphtyper_DEL_longreadhomref_nofilt.len.csv \
+	truvari_graphtyper_INS_nofilt.len.csv \
+	truvari_graphtyper_INS_longreadhomref_nofilt.len.csv
+
+.PHONY: graphtyper_concordance
+
+# Lumpy analysis
+
+lumpy/HG002.lumpy.vcf.gz : $(LUMPY_VCF)
+	mkdir -p $(dir $@)
+	bcftools view -i 'ABS(INFO/SVLEN) >= 50 && ABS(INFO/SVLEN) <= 15000000 && (SVTYPE ~ "^DEL" || SVTYPE ~ "^INS")' -s HG002 -Oz -o $@ $<
+	bcftools index -t $@
+
+lumpy/HG002.lumpy.DEL.vcf.gz : lumpy/HG002.lumpy.vcf.gz
+	bcftools view -i '(SVTYPE ~ "^DEL")' -Oz -o $@ $<
+	bcftools index -t $@
+
+# Filter based on the variants in GIAB we are comparing against
+lumpy/HG002.lumpy.INS.vcf.gz : lumpy/HG002.lumpy.vcf.gz
+	bcftools view -i '(SVTYPE ~ "^INS" || SVTYPE ~ "^DUP") && abs(INFO/SVLEN) < 150000' $< | python3 ~/research/npsv/scripts/fixSVVCF -r $(REFERENCE) -i /dev/stdin | bgzip -c > $@
+	bcftools index -t $@
+
+lumpy/%.npsv.vcf lumpy/%.sim.tsv lumpy/%.real.tsv : lumpy/%.vcf.gz $(BAM) $(notdir $(BAM:.bam=.stats.json))
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) \
+		--n $(ITER) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) 
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+
+# 'Hybrid' VCF genotyping
+lumpy/HG002.lumpy.DEL.hybrid.npsv.vcf.gz : lumpy/HG002.lumpy.DEL.vcf.gz lumpy/HG002.lumpy.sim.tsv lumpy/HG002.lumpy.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Lumpy calls duplications not insertions, so the results are not directly comparabale to GIAB data
+
+$(eval $(call truvari_DEL_discovery_template, truvari_lumpy_DEL, lumpy/HG002.lumpy.DEL.vcf.gz))
+$(eval $(call truvari_DEL_discovery_template, truvari_npsv_hybrid_lumpy_DEL, lumpy/HG002.lumpy.DEL.hybrid.npsv.vcf.gz))
+
+lumpy_concordance: \
+	truvari_lumpy_DEL/summary.txt \
+	truvari_npsv_hybrid_lumpy_DEL/summary.txt
+	
+
+.PHONY: lumpy_concordance
+
+
+# Manta analysis
+
+manta/HG002.manta.vcf.gz : $(MANTA_VCF)
+	mkdir -p $(dir $@)
+	bcftools view -t 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,X,Y -i 'ABS(INFO/SVLEN) >= 50 && ABS(INFO/SVLEN) <= 15000000 && (SVTYPE ~ "^DEL" || SVTYPE ~ "^INS")' -s HG002 -Oz -o $@ $<
+	bcftools index -t $@
+
+manta/%.npsv.vcf manta/%.sim.tsv manta/%.real.tsv : manta/%.vcf.gz $(BAM) $(notdir $(BAM:.bam=.stats.json))
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) \
+		--n $(ITER) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-n $(ITER) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-n $(ITER) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) 
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+# 'Hybrid' VCF genotyping
+manta/HG002.manta.DEL.hybrid.npsv.vcf.gz : manta/HG002.manta.DEL.vcf.gz manta/HG002.manta.sim.tsv manta/HG002.manta.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+manta/HG002.manta.INS.single.npsv.vcf.gz : manta/HG002.manta.INS.vcf.gz manta/HG002.manta.sim.tsv manta/HG002.manta.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS)  \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+manta/HG002.manta.INS.hybrid.npsv.vcf.gz : manta/HG002.manta.INS.vcf.gz manta/HG002.manta.sim.tsv manta/HG002.manta.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG002 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+
+$(eval $(call truvari_DEL_discovery_template, truvari_manta_DEL, manta/HG002.manta.DEL.vcf.gz))
+$(eval $(call truvari_DEL_discovery_template, truvari_manta_DEL_nofilt, manta/HG002.manta.DEL.nofilt.vcf.gz))
+$(eval $(call truvari_INS_discovery_template, truvari_manta_INS, manta/HG002.manta.INS.vcf.gz))
+$(eval $(call truvari_INS_discovery_template, truvari_manta_INS_nofilt, manta/HG002.manta.INS.nofilt.vcf.gz))
+
+$(eval $(call truvari_DEL_discovery_template, truvari_npsv_hybrid_manta_DEL, manta/HG002.manta.DEL.hybrid.npsv.vcf.gz))
+$(eval $(call truvari_DEL_discovery_template, truvari_npsv_hybrid_manta_DEL_nofilt, manta/HG002.manta.DEL.hybrid.npsv.nofilt.vcf.gz))
+
+$(eval $(call truvari_INS_discovery_template, truvari_npsv_hybrid_manta_INS, manta/HG002.manta.INS.hybrid.npsv.vcf.gz))
+$(eval $(call truvari_INS_discovery_template, truvari_npsv_hybrid_manta_INS_nofilt, manta/HG002.manta.INS.hybrid.npsv.nofilt.vcf.gz))
+
+$(eval $(call truvari_INS_discovery_template, truvari_npsv_single_manta_INS, manta/HG002.manta.INS.single.npsv.vcf.gz))
+$(eval $(call truvari_INS_discovery_template, truvari_npsv_single_manta_INS_nofilt, manta/HG002.manta.INS.single.npsv.nofilt.vcf.gz))
+
+
+manta_concordance: \
+	truvari_manta_DEL/summary.txt \
+	truvari_manta_DEL_nofilt/summary.txt \
+	truvari_manta_INS/summary.txt \
+	truvari_manta_INS_nofilt/summary.txt \
+	truvari_npsv_hybrid_manta_DEL/summary.txt \
+	truvari_npsv_hybrid_manta_DEL_nofilt/summary.txt \
+	truvari_npsv_hybrid_manta_INS/summary.txt \
+	truvari_npsv_hybrid_manta_INS_nofilt/summary.txt \
+	truvari_npsv_single_manta_INS/summary.txt \
+	truvari_npsv_single_manta_INS_nofilt/summary.txt
+
+.PHONY: manta_concordance
+
+# Breakpoint analysis
+
+# Use Truvari to link PBSV calls (presumably with more precise breakpoints) to the GIAB calls to etimate
+# breakpoint differences
+
+HG002_hs37d5.pbsv.filtered.vcf.gz : HG002_hs37d5.pbsv.vcf.gz
+	bcftools view -i '(SVTYPE ~ "^DEL" || SVTYPE ~ "^INS") & abs(INFO/SVLEN) >= 50 & abs(INFO/SVLEN) <= 15000000' -Oz -o $@ $<
+	bcftools index -t $@
+
+HG002_hs37d5.pbsv.DEL.vcf.gz : HG002_hs37d5.pbsv.vcf.gz
+	bcftools annotate -x 'INFO/IMPRECISE' -i 'SVTYPE ~ "^DEL" & abs(INFO/SVLEN) >= 50 & abs(INFO/SVLEN) <= 15000000' -Oz -o $@ $<
+	bcftools index -t $@
+
+HG002_hs37d5.pbsv.INS.vcf.gz : HG002_hs37d5.pbsv.vcf.gz
+	bcftools annotate -x 'INFO/IMPRECISE' -i 'SVTYPE ~ "^INS" & abs(INFO/SVLEN) >= 50 & abs(INFO/SVLEN) <= 15000000' -Oz -o $@ $<
+	bcftools index -t $@
+
+truvari_pbsv_DEL/tp-base.vcf : HG002_hs37d5.pbsv.DEL.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.vcf.gz
+	rm -rf $(dir $@)
+	truvari bench -f $(REFERENCE) -b $(word 2,$^) -c $< -o $(dir $@) \
+		--includebed $(GIAB_BED) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim 0.7 --pctsize 0.7 --refdist 2000 \
+		--passonly
+
+truvari_pbsv_INS/tp-base.vcf : HG002_hs37d5.pbsv.INS.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.INS.vcf.gz
+	rm -rf $(dir $@)
+	truvari bench -f $(REFERENCE) -b $(word 2,$^) -c $< -o $(dir $@) \
+		--includebed $(GIAB_BED) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim 0.7 --pctsize 0.7 --refdist 2000 \
+		--passonly
+
+truvari_pbsv_%_distance.tsv : truvari_pbsv_%/tp-base.vcf
+	echo -e "ID\tMatchID\tStartDistance\tEndDistance\tTRall\tTRgt100" > $@
+	bcftools query -f "%ID\t%INFO/MatchId\t%INFO/StartDistance\t%INFO/EndDistance\t%INFO/TRall\t%INFO/TRgt100\n" $< >> $@
+
+%_DEL.offset.csv : %_DEL/tp-call.vcf truvari_pbsv_DEL_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+%_INS.offset.csv : %_INS/tp-call.vcf truvari_pbsv_INS_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+%_DEL_nofilt.offset.csv : %_DEL_nofilt/tp-call.vcf truvari_pbsv_DEL_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+%_INS_nofilt.offset.csv : %_INS_nofilt/tp-call.vcf truvari_pbsv_INS_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+npsv_offset/%.npsv.vcf npsv_offset/%.sim.tsv npsv_offset/%.real.tsv : %.vcf.gz $(BAM) $(notdir $(BAM:.bam=.stats.json))
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) --profile $(PROFILE) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-gt-mode variant --DEL-n $(ITER) --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode single --INS-n 1 --INS-classifier $(SINGLE_KLASS)
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+npsv_offset/HG002_hs37d5.pbsv.INS.single.npsv.vcf.gz : HG002_hs37d5.pbsv.INS.vcf.gz npsv_offset/HG002_hs37d5.pbsv.INS.sim.tsv npsv_offset/HG002_hs37d5.pbsv.INS.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) \
+		--samples HG002 --downsample 1 --filter-bed $(GIAB_BED) \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+npsv_offset/HG002_hs37d5.pbsv.DEL.hybrid.npsv.vcf.gz : HG002_hs37d5.pbsv.DEL.vcf.gz npsv_offset/HG002_hs37d5.pbsv.DEL.sim.tsv npsv_offset/HG002_hs37d5.pbsv.DEL.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) \
+		--samples HG002 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+npsv_offset/HG002_hs37d5.pbsv.DEL.variant.npsv.vcf.gz : npsv_offset/HG002_hs37d5.pbsv.DEL.npsv.vcf
+	bgzip -c $< > $@
+	bcftools index -t $@
+
+# Variant (DEL)
+truvari_pbsv_npsv_variant_DEL/summary.txt truvari_pbsv_npsv_variant_DEL/tp-call.vcf : npsv_offset/HG002_hs37d5.pbsv.DEL.variant.npsv.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.vcf.gz
+	rm -rf $(dir $@)
+	truvari bench -f $(REFERENCE) -b $(word 2,$^) -c $< -o $(dir $@) \
+		--includebed $(GIAB_BED) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim 0.7 --pctsize 0.7 --refdist 2000 \
+		--passonly --bSample HG002 --cSample HG002
+
+truvari_pbsv_npsv_variant_DEL_distance.tsv : truvari_pbsv_npsv_variant_DEL/tp-call.vcf
+	echo -e "ID\tMatchID\tStartDistance\tEndDistance" > $@
+	bcftools query -f "%ID\t%INFO/MatchId\t%INFO/StartDistance\t%INFO/EndDistance\n" $< >> $@
+
+truvari_pbsv_npsv_variant_DEL.offset.csv : truvari_pbsv_npsv_variant_DEL/tp-call.vcf truvari_pbsv_npsv_variant_DEL_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+# Hybrid (DEL)
+truvari_pbsv_npsv_hybrid_DEL/summary.txt truvari_pbsv_npsv_hybrid_DEL/tp-call.vcf : npsv_offset/HG002_hs37d5.pbsv.DEL.hybrid.npsv.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.vcf.gz
+	rm -rf $(dir $@)
+	truvari bench -f $(REFERENCE) -b $(word 2,$^) -c $< -o $(dir $@) \
+		--includebed $(GIAB_BED) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim 0.7 --pctsize 0.7 --refdist 2000 \
+		--passonly --bSample HG002 --cSample HG002
+
+truvari_pbsv_npsv_hybrid_DEL_distance.tsv : truvari_pbsv_npsv_hybrid_DEL/tp-call.vcf
+	echo -e "ID\tMatchID\tStartDistance\tEndDistance" > $@
+	bcftools query -f "%ID\t%INFO/MatchId\t%INFO/StartDistance\t%INFO/EndDistance\n" $< >> $@
+
+truvari_pbsv_npsv_hybrid_DEL.offset.csv : truvari_pbsv_npsv_hybrid_DEL/tp-call.vcf truvari_pbsv_npsv_hybrid_DEL_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+# Single (single)
+truvari_pbsv_npsv_single_INS/summary.txt truvari_pbsv_npsv_single_INS/tp-call.vcf : npsv_offset/HG002_hs37d5.pbsv.INS.single.npsv.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.INS.vcf.gz
+	rm -rf $(dir $@)
+	truvari bench -f $(REFERENCE) -b $(word 2,$^) -c $< -o $(dir $@) \
+		--includebed $(GIAB_BED) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim 0.7 --pctsize 0.7 --refdist 2000 \
+		--passonly --bSample HG002 --cSample HG002
+
+truvari_pbsv_npsv_single_INS_distance.tsv : truvari_pbsv_npsv_single_INS/tp-call.vcf
+	echo -e "ID\tMatchID\tStartDistance\tEndDistance" > $@
+	bcftools query -f "%ID\t%INFO/MatchId\t%INFO/StartDistance\t%INFO/EndDistance\n" $< >> $@
+
+truvari_pbsv_npsv_single_INS.offset.csv : truvari_pbsv_npsv_single_INS/tp-call.vcf truvari_pbsv_npsv_single_INS_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+# Treat PBSV variants like proposal candidates
+
+npsv_offset/HG002_hs37d5.pbsv.DEL.propose.vcf.gz : truvari_pbsv_DEL/tp-call.vcf truvari_pbsv_DEL/tp-base.vcf HG002_hs37d5.pbsv.DEL.vcf.gz
+	python3 join_offset.py $^ | bcftools sort -Oz -o $(TEMPDIR)/$(notdir $@)
+	bcftools index -t  $(TEMPDIR)/$(notdir $@)
+	bcftools merge -m none -Oz -o $@ $(TEMPDIR)/$(notdir $@) HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.vcf.gz
+	bcftools index -t $@
+
+npsv_offset/HG002_hs37d5.pbsv.DEL.propose.npsv.vcf : npsv_offset/HG002_hs37d5.pbsv.DEL.propose.vcf.gz $(BAM) $(notdir $(BAM:.bam=.stats.json))
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix HG002_hs37d5.pbsv.DEL.propose \
+		--DEL-n $(ITER) \
+		--DEL-gt-mode variant \
+		--DEL-classifier $(VARIANT_KLASS) \
+		--dm2
+	mv $(TEMPDIR)/HG002_hs37d5.pbsv.DEL.propose.npsv.vcf $(TEMPDIR)/HG002_hs37d5.pbsv.DEL.propose.sim.tsv $(TEMPDIR)/HG002_hs37d5.pbsv.DEL.propose.real.tsv $(dir $@)
+
+# Just original variants plus PBSV calls
+npsv_offset/HG002_hs37d5.pbsv.DEL.propose.npsv.refine.vcf.gz : npsv_offset/HG002_hs37d5.pbsv.DEL.propose.npsv.vcf
+	npsvg refine -i $< --exclude-orig-ref | bgzip -c > $@
+	bcftools index -t $@
+
+# Mix PBSV calls in with other proposals
+npsv_offset/%.propose.npsv.vcf.gz : npsv_giab_propose_DEL/%.npsv.vcf
+	bcftools sort -Oz -o $@ $<
+	bcftools index -t $@
+
+npsv_offset/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.pbsv.DEL.propose.npsv.refine.vcf.gz : $(foreach start, $(GIAB_DEL_FILTERED_BLOCKS), npsv_offset/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.$(start)_$(shell expr $(start) + 100 - 1 ).propose.npsv.vcf.gz) npsv_offset/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.DEL.$(GIAB_DEL_FILTERED_LAST).propose.npsv.vcf.gz
+	bcftools view -i 'INFO/ORIGINAL != "."' -Oz -o $(TEMPDIR)/HG002_hs37d5.pbsv.DEL.propose.npsv.vcf.gz npsv_offset/HG002_hs37d5.pbsv.DEL.propose.npsv.vcf
+	bcftools index -t $(TEMPDIR)/HG002_hs37d5.pbsv.DEL.propose.npsv.vcf.gz
+	bcftools concat -a $(TEMPDIR)/HG002_hs37d5.pbsv.DEL.propose.npsv.vcf.gz $^ | npsvg refine -i /dev/stdin --exclude-orig-ref | bgzip -c > $@
+	bcftools index -t $@
+
+
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_pbsv_propose_variant_DEL_longreadhomref, npsv_offset/HG002_hs37d5.pbsv.DEL.propose.npsv.refine.vcf.gz))
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_npsv_pbsv_all_propose_variant_DEL_longreadhomref, npsv_offset/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.pbsv.DEL.propose.npsv.refine.vcf.gz))
+
+# Run Paragraph on the offset variants
+paragraph_offset/HG002_hs37d5.pbsv.filtered.paragraph.vcf.gz : HG002_hs37d5.pbsv.filtered.vcf.gz
+	mkdir -p $(dir $@)
+	padAlleles -r $(REFERENCE) -i $< | bcftools sort -Oz -o $@
+	bcftools index -t $@
+
+paragraph_offset/genotypes.vcf.gz : paragraph_offset/HG002_hs37d5.pbsv.filtered.paragraph.vcf.gz samples.txt
+	multigrmpy.py \
+		--scratch-dir $(TEMPDIR) -t $(THREADS) \
+		-i $< \
+		-m samples.txt \
+		-r $(REFERENCE) \
+		-o $(dir $@)
+	bcftools index -t $@
+
+# We force all variants to have ploidy of 2
+paragraph_offset/HG002.HG002_hs37d5.pbsv.filtered.paragraph.vcf.gz : paragraph_offset/genotypes.vcf.gz
+	bcftools +fixploidy $< -- -f 2 | bcftools view -s HG002 -Oz -o $@ -
+	bcftools index -t $@
+
+truvari_pbsv_paragraph_DEL_nofilt/summary.txt truvari_pbsv_paragraph_DEL_nofilt/tp-call.vcf : paragraph_offset/HG002.HG002_hs37d5.pbsv.filtered.paragraph.DEL.nofilt.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.vcf.gz
+	rm -rf $(dir $@)
+	truvari bench -f $(REFERENCE) -b $(word 2,$^) -c $< -o $(dir $@) \
+		--includebed $(GIAB_BED) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim 0.7 --pctsize 0.7 --refdist 2000 \
+		--passonly --bSample HG002 --cSample HG002
+
+truvari_pbsv_paragraph_INS_nofilt/summary.txt truvari_pbsv_paragraph_INS_nofilt/tp-call.vcf : paragraph_offset/HG002.HG002_hs37d5.pbsv.filtered.paragraph.INS.nofilt.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.INS.vcf.gz
+	rm -rf $(dir $@)
+	truvari bench -f $(REFERENCE) -b $(word 2,$^) -c $< -o $(dir $@) \
+		--includebed $(GIAB_BED) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim 0.7 --pctsize 0.7 --refdist 2000 \
+		--passonly --bSample HG002 --cSample HG002
+
+truvari_pbsv_paragraph_DEL_nofilt_distance.tsv : truvari_pbsv_paragraph_DEL_nofilt/tp-call.vcf
+	echo -e "ID\tMatchID\tStartDistance\tEndDistance" > $@
+	bcftools query -f "%ID\t%INFO/MatchId\t%INFO/StartDistance\t%INFO/EndDistance\n" $< >> $@
+
+truvari_pbsv_paragraph_DEL_nofilt.offset.csv : truvari_pbsv_paragraph_DEL_nofilt/tp-call.vcf truvari_pbsv_paragraph_DEL_nofilt_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+truvari_pbsv_paragraph_INS_nofilt_distance.tsv : truvari_pbsv_paragraph_INS_nofilt/tp-call.vcf
+	echo -e "ID\tMatchID\tStartDistance\tEndDistance" > $@
+	bcftools query -f "%ID\t%INFO/MatchId\t%INFO/StartDistance\t%INFO/EndDistance\n" $< >> $@
+
+truvari_pbsv_paragraph_INS_nofilt.offset.csv : truvari_pbsv_paragraph_INS_nofilt/tp-call.vcf truvari_pbsv_paragraph_INS_nofilt_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+# Run svviz2 on the offset variants
+
+pbsv_filtered_inputs: HG002_hs37d5.pbsv.filtered.vcf.gz HG002_hs37d5.pbsv.filtered.vcf.gz.gbi
+	./slurm/giab_inputs.bash $< $@
+
+PBSV_FILTERED_BLOCKS := $(shell seq 1 100 21300)
+PBSV_FILTERED_LAST := 21301_21329
+
+svviz2_offset/%.report.tsv : pbsv_filtered_inputs/%.vcf.gz
+	mkdir -p $(dir $@)
+	svviz2 \
+		--ref $(REFERENCE) -o $(dir $@) --report-only \
+		--variants <(bcftools annotate --set-id +'%CHROM\_%POS\_%INFO/END' $<) \
+		$(BAM) $(MAT_BAM) $(PAT_BAM) 
+
+svviz2_offset/ashkenazi-trio.HG002_hs37d5.pbsv.filtered.svviz2_mapq.vcf.gz : HG002_hs37d5.pbsv.filtered.vcf.gz
+	svviz22vcf --model mapq -i $< -r svviz2_offset \
+		-s $(notdir $(BAM:.bam=)) \
+		-s $(notdir $(PAT_BAM:.bam=)) \
+		-s $(notdir $(MAT_BAM:.bam=)) \
+		-o /dev/stdout | \
+		bcftools reheader -s <(echo -e "HG002\nHG003\nHG004") - | \
+		sed 's/\bnan\b/./g' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svviz2_offset/HG002.HG002_hs37d5.pbsv.filtered.svviz2_mapq.vcf.gz : svviz2_offset/ashkenazi-trio.HG002_hs37d5.pbsv.filtered.svviz2_mapq.vcf.gz
+	bcftools view -s HG002 -Oz -o $@ $<
+	bcftools index -t $@
+
+truvari_pbsv_svviz2_mapq_DEL/summary.txt truvari_pbsv_svviz2_mapq_DEL/tp-call.vcf : svviz2_offset/HG002.HG002_hs37d5.pbsv.filtered.svviz2_mapq.DEL.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.DEL.vcf.gz
+	rm -rf $(dir $@)
+	truvari bench -f $(REFERENCE) -b $(word 2,$^) -c $< -o $(dir $@) \
+		--includebed $(GIAB_BED) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim 0.7 --pctsize 0.7 --refdist 2000 \
+		--passonly --bSample HG002 --cSample HG002
+
+truvari_pbsv_svviz2_mapq_INS/summary.txt truvari_pbsv_svviz2_mapq_INS/tp-call.vcf : svviz2_offset/HG002.HG002_hs37d5.pbsv.filtered.svviz2_mapq.INS.vcf.gz HG002_SVs_Tier1_v0.6.genotyped.passing.INS.vcf.gz
+	rm -rf $(dir $@)
+	truvari bench -f $(REFERENCE) -b $(word 2,$^) -c $< -o $(dir $@) \
+		--includebed $(GIAB_BED) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim 0.7 --pctsize 0.7 --refdist 2000 \
+		--passonly --bSample HG002 --cSample HG002
+
+truvari_pbsv_svviz2_mapq_DEL_distance.tsv : truvari_pbsv_svviz2_mapq_DEL/tp-call.vcf
+	echo -e "ID\tMatchID\tStartDistance\tEndDistance" > $@
+	bcftools query -f "%ID\t%INFO/MatchId\t%INFO/StartDistance\t%INFO/EndDistance\n" $< >> $@
+
+truvari_pbsv_svviz2_mapq_DEL.offset.csv : truvari_pbsv_svviz2_mapq_DEL/tp-call.vcf truvari_pbsv_svviz2_mapq_DEL_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+truvari_pbsv_svviz2_mapq_INS_distance.tsv : truvari_pbsv_svviz2_mapq_INS/tp-call.vcf
+	echo -e "ID\tMatchID\tStartDistance\tEndDistance" > $@
+	bcftools query -f "%ID\t%INFO/MatchId\t%INFO/StartDistance\t%INFO/EndDistance\n" $< >> $@
+
+truvari_pbsv_svviz2_mapq_INS.offset.csv : truvari_pbsv_svviz2_mapq_INS/tp-call.vcf truvari_pbsv_svviz2_mapq_INS_distance.tsv
+	python3 $(NPSV_ROOT)/paper/offset_stats.py -d $(word 2,$^) $< > $@ 
+
+offset_concordance: \
+	truvari_pbsv_npsv_variant_DEL/summary.txt \
+	truvari_pbsv_npsv_hybrid_DEL/summary.txt \
+	truvari_pbsv_npsv_single_INS/summary.txt \
+	truvari_pbsv_DEL_distance.tsv \
+	truvari_pbsv_INS_distance.tsv \
+	truvari_npsv_single_DEL.offset.csv \
+	truvari_npsv_variant_DEL.offset.csv \
+	truvari_npsv_hybrid_DEL.offset.csv \
+	truvari_npsv_single_INS.offset.csv \
+	truvari_npsv_variant_INS.offset.csv \
+	truvari_npsv_hybrid_INS.offset.csv \
+	truvari_svviz2_count_DEL.offset.csv \
+	truvari_svviz2_count_INS.offset.csv \
+	truvari_svviz2_mapq_DEL.offset.csv \
+	truvari_svviz2_mapq_INS.offset.csv \
+	truvari_paragraph_DEL_nofilt.offset.csv \
+	truvari_paragraph_INS_nofilt.offset.csv \
+	truvari_pbsv_npsv_variant_DEL.offset.csv \
+	truvari_pbsv_npsv_hybrid_DEL.offset.csv \
+	truvari_pbsv_npsv_single_INS.offset.csv \
+	truvari_pbsv_paragraph_DEL_nofilt.offset.csv \
+	truvari_pbsv_paragraph_INS_nofilt.offset.csv \
+	truvari_pbsv_svviz2_mapq_DEL.offset.csv \
+	truvari_pbsv_svviz2_mapq_INS.offset.csv
+
+@PHONY: offset_concordance
+
+# Demo variant
+
+# tabix -h HG002_SVs_Tier1_v0.6.genotyped.passing.vcf.gz 12:22129565-22130387 | bgzip -c > plots/12_22129565_22130387_DEL.vcf.gz && tabix plots/12_22129565_22130387_DEL.vcf.gz
+# npsvg plot --sim npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv --real npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.real.tsv -v plots/12_22129565_22130387_DEL.vcf.gz -o plots/
+
+# grep -Fw "22129565" \
+# 	truvari_npsv_single_DEL_longreadhomref/tp-call.vcf \
+# 	truvari_npsv_variant_DEL_longreadhomref/tp-call.vcf \
+# 	truvari_npsv_hybrid_DEL_longreadhomref/tp-call.vcf \
+# 	truvari_svtyper_DEL_longreadhomref/tp-call.vcf \
+# 	truvari_sv2_DEL_longreadhomref_nofilt/tp-call.vcf \
+# 	truvari_paragraph_DEL_longreadhomref_nofilt/tp-call.vcf \
+# 	truvari_delly_DEL_longreadhomref_nofilt/tp-call.vcf \
+# 	truvari_svviz2_count_DEL_longreadhomref/tp-call.vcf \
+# 	truvari_svviz2_mapq_DEL_longreadhomref/tp-call.vcf \
+# 	truvari_graphtyper_DEL_nofilt/tp-call.vcf \
+# 	truvari_genomestrip_DEL_longreadhomref/tp-call.vcf | grep "MatchGT"
+
+# Venn comparison
+npsv_hybrid_DEL_longreadhomref_vs_svviz2_mapq_DEL_longreadhomref : truvari_npsv_hybrid_DEL_longreadhomref/tp-call.vcf.gz truvari_svviz2_mapq_DEL_longreadhomref/tp-call.vcf.gz
+	mkdir -p $@
+	bcftools isec -w1 -n~10 -i 'MatchGT=="TRUE"' $^ | python3 $(NPSV_ROOT)/paper/variant_stats.py vntr-conc /dev/stdin > $@/npsv_unique.csv
+	bcftools isec -w2 -n~01 -i 'MatchGT=="TRUE"' $^ | python3 $(NPSV_ROOT)/paper/variant_stats.py vntr-conc /dev/stdin > $@/other_unique.csv
+
+.PHONY: npsv_hybrid_DEL_longreadhomref_vs_svviz2_mapq_DEL_longreadhomref
+
+# Benchmarking
+runtime.csv : benchmarking-30456.out benchmarking-30457.out benchmarking-30458.out benchmarking-30459.out benchmarking-30460.out benchmarking-30462.out benchmarking-30618.out benchmarking-30466.out benchmarking-30619.out benchmarking-30464.out benchmarking-30634.out
+	grep -h "^Timing" $^ > $@
+
+memory.txt : runtime.csv
+	sacct -P --format="JobID,ElapsedRaw,MaxRSS" -j $$(cut -f 8 -d ',' $< | awk '{ print $$1 ".batch" }' | tr '\n' ',') > $@
+
+# Single model genotyping
+distributions/HG002.%.single.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz distributions/%.sim.tsv distributions/%.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG004 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS)  \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Per-variant VCF genotyping
+distributions/HG002.%.variant.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz distributions/%.sim.tsv distributions/%.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG004 \
+		--DEL-gt-mode variant --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-classifier $(VARIANT_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Hybrid model VCF genotyping
+distributions/HG002.%.hybrid.npsv.vcf.gz : HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.vcf.gz distributions/%.sim.tsv distributions/%.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples HG004 --downsample 1 --filter-bed $(GIAB_BED) \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+
+
+# DUPHOLD comparison
+duphold/%.duphold.vcf.gz : %.vcf.gz
+	mkdir -p $(dir $@)
+	duphold -t $(THREADS) -v $< -b $(BAM) -f $(REFERENCE) -o $@
+	bcftools index -t $@
+
+duphold/HG002.lumpy.DEL.duphold.vcf.gz : lumpy/HG002.lumpy.DEL.vcf.gz
+	mkdir -p $(dir $@)
+	duphold -t $(THREADS) -v $< -b $(BAM) -f $(REFERENCE) -o $@
+	bcftools index -t $@
+
+
+duphold/%.filtered.vcf.gz : duphold/%.vcf.gz 
+	bcftools view -i '(SVTYPE = "DEL" & FMT/DHFFC[0] < 0.7) | (SVTYPE = "DUP" & FMT/DHBFC[0] > 1.3)' -Oz -o $@ $<
+	bcftools index -t $@
+
+$(eval $(call truvari_DEL_longreadhomref_template, truvari_duphold_giab_DEL_longreadhomref, duphold/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.duphold.filtered.vcf.gz))
+$(eval $(call truvari_DEL_discovery_template, truvari_duphold_lumpy_DEL, duphold/HG002.lumpy.DEL.duphold.filtered.vcf.gz))
+
+
+
+
+.SECONDARY:
+
+.PHONY: \
+	load_shared_ref \
+	giab_inputs
+

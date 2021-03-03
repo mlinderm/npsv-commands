@@ -1,0 +1,1196 @@
+SHELL := /bin/bash -o pipefail
+
+TEMPDIR ?= $(SCRATCH)
+THREADS ?= 1
+VERBOSE ?=
+LOG_LEVEL ?= -v
+
+
+NPSV_ROOT ?= /home/mlinderman/research/npsv
+
+REFERENCE ?= /storage/mlinderman/ngs/resources/gatk/b37/human_g1k_v37.fasta
+GENOME ?= $(NPSV_ROOT)/etc/human_g1k_v37.genome
+GAPS ?= $(NPSV_ROOT)/etc/human_g1k_v37.gaps.bed.gz
+DBSNP_VCF ?= /storage/mlinderman/ngs/resources/gatk/b37/dbsnp_138.b37.vcf.gz
+SIMPLE_REPEATS ?= /storage/mlinderman/ngs/resources/annotations/simple_repeats.b37.bed.gz
+
+SAMPLE ?= NA12878
+PED ?= ceph-trio.ped
+BAM ?= /storage/mlinderman/ngs/resources/ceph-trio/b37/final/NA12878/NA12878-ready.bam
+PAT_BAM ?= /storage/mlinderman/ngs/resources/ceph-trio/b37/final//NA12891/NA12891-ready.bam
+MAT_BAM ?= /storage/mlinderman/ngs/resources/ceph-trio/b37/final//NA12892/NA12892-ready.bam
+SNV ?= /storage/mlinderman/ngs/resources/ceph-trio/b37/final/2020-07-13_project/ceph-gatk-haplotype-annotated.vcf.gz
+
+SVCLASSIFY_DEL_BED ?= giab-svclassify-deletions-2015-05-22.bed
+LUMPY_VCF ?= /data/projects/ngs/resources/ceph-trio/final/NA12878/ceph-lumpy.vcf.gz
+METASV_VCF ?= /data/projects/ngs/resources/ceph-trio/final/NA12878/ceph-metasv.vcf.gz
+MANTA_VCF ?= /data/projects/ngs/resources/ceph-trio/work/structural/NA12878/manta/results/variants/diploidSV.vcf.gz
+
+RECIPROCAL_OVERLAP ?= 0.8
+
+ITER ?= 1
+REUSE ?=
+SIMREF ?= 
+
+SINGLE_KLASS ?= svm
+VARIANT_KLASS ?= rf
+HYBRID_KLASS ?= svm
+HYBRID_SIZE ?= 1000
+
+# Sequencing statistics obtained from Picard and GATK metrics
+HAP_COVERAGE ?= 26
+READ_LENGTH ?= 100
+MEAN_FRAGMENT ?= 313.9
+STD_FRAGMENT ?= 74.6
+PROFILE ?= HS20
+
+# Common indexing operations
+%.vcf.gz.gbi : %.vcf.gz
+	grabix index $<
+
+%.nofilt.vcf.gz : %.vcf.gz
+	bcftools annotate -Oz -o $@ -x "FILTER" $<
+	bcftools index -t $@
+
+# Select just deletions or insertions
+%.DEL.vcf.gz  : %.vcf.gz 
+	bcftools view -Oz -o $@ -i '(SVTYPE ~ "^DEL")' $<
+	bcftools index -t $@
+
+%.INS.vcf.gz  : %.vcf.gz 
+	bcftools view -Oz -o $@ -i '(SVTYPE ~ "^INS")' $<
+	bcftools index -t $@
+
+# Create VCFs with specific genotypes to faciliate create truth tables
+%.0.vcf.gz : %.vcf.gz
+	bcftools view -s NA12878 $< | bcftools view -C 1 -g hom -Oz -o $@ 
+	bcftools index -t $@
+
+%.1.vcf.gz : %.vcf.gz
+	bcftools view -s NA12878 $< | bcftools view -g het -Oz -o $@
+	bcftools index -t $@
+
+%.2.vcf.gz : %.vcf.gz
+	bcftools view -s NA12878 $< | bcftools view -c 1 -g hom -Oz -o $@
+	bcftools index -t $@
+
+# Manage reference data
+load_shared_ref: $(REFERENCE)
+	bwa shm $<
+
+unload_shared_ref: $(REFERENCE)
+	bwa shm -d
+
+# Although SVClassify reports the file as a BED file, it is actually one-indexed. To make it a compliant BED file
+# we need to make the coordiantes 0-indexed half open. This effectively means subtracting one from the start coordinate.
+# Note that by default this adds 10 base confidence interval to breakpoints
+giab-svclassify-deletions-2015-05-22.vcf.gz : $(SVCLASSIFY_DEL_BED)
+	awk 'BEGIN { OFS="\t"; } { print $$1, $$2-1, $$3, "DEL"; }' $< | \
+		./bed2vcf -R $(REFERENCE) /dev/stdin DEL | \
+		bcftools view -i '(SVTYPE = "DEL" & INFO/SVLEN <= -50 & INFO/SVLEN >= -15000000)' -Oz -o $@ -
+	bcftools index -t $@
+
+svplaudit.DEL.vcf.gz : svplaudit.vcf.gz
+	bcftools view -s NA12878 -i 'SVTYPE ~ "DEL" & INFO/SVP >= 0' $< | \
+		bcftools norm -d none | \
+		bcftools view -g ^miss | \
+		sed 's/<CN0>/<DEL>/' | \
+		sed 's/ID=SVPD,Number=1/ID=SVPD,Number=./' | \
+		awk '$$0 ~ /^#/ || $$5 !~ /,/' | \
+		fixSVVCF -i /dev/stdin | \
+		bcftools view -Oz -o $@ -i 'abs(INFO/SVLEN) >= 50 & abs(INFO/SVLEN) < 15000000' -
+	bcftools index -t $@
+
+svplaudit.confirmed.DEL.vcf.gz : svplaudit.DEL.vcf.gz
+	bcftools view -i 'INFO/SVP > 0.5' -Oz -o $@ $<
+	bcftools index -t $@
+
+# Clean up with dataset, including splitting out NA12878 trio, removing calls without genotypes and dropping multi-allelic sites
+polaris.fai : /storage/mlinderman/ngs/resources/gatk/hg19/ucsc.hg19.fasta.fai
+	grep -E -w "chr([1-9]|[1-2][0-9]|[XY])" $< > $@
+
+illumina-polaris-v2.0.genoytped.passing.vcf.gz : all.merge.hg19.vcf.gz 	
+	bcftools reheader -f polaris.fai $< | \
+		bcftools view -s NA12878,NA12891,NA12892 | \
+		sed -e 's/##contig=<ID=chr/##contig=<ID=/' -e 's/##contig=<ID=M,length=16569>/##contig=<ID=MT,length=16569>/' | \
+		sed 's/^chr//' | \
+		bcftools norm -d none | \
+		bcftools view -g ^miss -f PASS | \
+		bcftools view -e 'FORMAT/CN!="."' | \
+		awk '$$0 ~ /^#/ || $$5 !~ /,/' | \
+		fixSVVCF -r $(REFERENCE) -i /dev/stdin | \
+		bcftools view -t ^Y,MT -i '(SVTYPE ~ "DEL" & INFO/SVLEN <= -50 & INFO/SVLEN >= -15000000) | (SVTYPE ~ "INS" & INFO/SVLEN >= 50 & INFO/SVLEN <= 15000000)' | \
+		bcftools sort -Oz -o $@ -
+	bcftools index -t $@
+
+
+%.len-dist.csv : %.vcf.gz
+	bcftools query -f '%INFO/SVLEN\n' $< > $@
+
+len_dist : \
+	svplaudit.confirmed.DEL.len-dist.csv \
+	svplaudit.DEL.len-dist.csv \
+	illumina-polaris-v2.0.genoytped.passing.len-dist.csv
+
+.PHONY: len_dist
+
+# Preprocessing
+
+define PICARD_template =
+picard_metrics/$(notdir $(1:.bam=.gc_bias.detail_metrics)) picard_metrics/$(notdir $(1:.bam=.alignment_summary_metrics)) picard_metrics/$(notdir $(1:.bam=.insert_size_metrics)) : $(1)
+	mkdir -p $$(dir $$@)
+	java -Xmx3G -jar $(PICARD_JAR) CollectMultipleMetrics \
+		I=$$< \
+		O=$$(dir $$@)$(notdir $(1:.bam=)) \
+		R=$(REFERENCE) \
+		DB_SNP=$(DBSNP_VCF) \
+		PROGRAM=null \
+		PROGRAM=CollectGcBiasMetrics \
+		PROGRAM=CollectAlignmentSummaryMetrics \
+		PROGRAM=CollectInsertSizeMetrics
+
+picard_metrics/$(notdir $(1:.bam=.wgs_metrics)) : $(1)
+	mkdir -p $$(dir $$@)
+	java -Xmx3G -jar $(PICARD_JAR) CollectWgsMetrics \
+       I=$$< \
+       O=$$@ \
+       R=$(REFERENCE) 
+endef
+
+$(eval $(call PICARD_template,$(BAM)))
+$(eval $(call PICARD_template,$(PAT_BAM)))
+$(eval $(call PICARD_template,$(MAT_BAM)))
+
+define PREPROCESS_template =
+$(notdir $(1:.bam=.stats.json)) : $(1) picard_metrics/$(notdir $(1:.bam=.gc_bias.detail_metrics)) picard_metrics/$(notdir $(1:.bam=.insert_size_metrics))
+	npsvg -t $(TEMPDIR) preprocess -r $(REFERENCE) -b $$< --picard-gc $$(word 2,$$^) --picard-insert $$(word 3,$$^) -o $$@
+endef
+
+$(eval $(call PREPROCESS_template,$(BAM)))
+$(eval $(call PREPROCESS_template,$(PAT_BAM)))
+$(eval $(call PREPROCESS_template,$(MAT_BAM)))
+
+# Split the input VCF files into 100 variant chunks
+
+SVCLASSIFY_BLOCKS := $(shell seq 1 100 2600)
+
+svclassify_inputs : giab-svclassify-deletions-2015-05-22.vcf.gz giab-svclassify-deletions-2015-05-22.vcf.gz.gbi
+	mkdir -p $@
+	bash slurm/inputs.bash $< $@
+
+BLOCK_SIZE := 100
+POLARIS_BLOCKS := $(shell seq 1 $(BLOCK_SIZE) 14800)
+POLARIS_LAST := 14801_14833
+
+polaris_inputs : illumina-polaris-v2.0.genoytped.passing.vcf.gz illumina-polaris-v2.0.genoytped.passing.vcf.gz.gbi
+	mkdir -p $@
+	bash slurm/inputs.bash $< $@
+
+define REAL_WITH_AC_template =
+$(4)/$(2).%.$(1).real.tsv : %.$(1).vcf.gz $(3) $(notdir $(3:.bam=.stats.json))
+	npsvg -t $(TEMPDIR) --threads $(THREADS) \
+		features \
+		-r $(REFERENCE) -i $$< -b $$(word 2,$$^) -o $$@ \
+		--stats-path $$(word 3,$$^) \
+		--ac $(1)
+endef
+
+# NPSV analysis (using the npsv module without variant proposal)
+npsv_svplaudit/svplaudit.DEL.vcf.gz : svplaudit.DEL.vcf.gz
+	mkdir -p $(dir $@)
+	fixSVVCF -r $(REFERENCE) -i $< | bgzip -c > $@
+	bcftools index -t $@	
+
+npsv_svplaudit/%.npsv.vcf npsv_svplaudit/%.sim.tsv npsv_svplaudit/%.real.tsv : npsv_svplaudit/svplaudit.DEL.vcf.gz $(BAM) $(notdir $(BAM:.bam=.stats.json))
+	mkdir -p $(dir $@)
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) --profile $(PROFILE) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-gt-mode variant --DEL-n $(ITER) --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-n $(ITER) --INS-classifier $(VARIANT_KLASS)
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+# 'Single-model' VCF genotyping
+NA12878.svplaudit.DEL.single.npsv.vcf.gz : npsv_svplaudit/svplaudit.DEL.vcf.gz npsv_svplaudit/svplaudit.DEL.sim.tsv npsv_svplaudit/svplaudit.DEL.real.tsv 
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 --downsample 1 \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# 'Per-variant' VCF genotyping
+NA12878.svplaudit.DEL.variant.npsv.vcf.gz : npsv_svplaudit/svplaudit.DEL.npsv.vcf 
+	bgzip -c $< > $@
+	bcftools index -t $@
+
+# 'Hybrid' VCF genotyping
+NA12878.svplaudit.DEL.hybrid.npsv.vcf.gz : npsv_svplaudit/svplaudit.DEL.vcf.gz npsv_svplaudit/svplaudit.DEL.sim.tsv npsv_svplaudit/svplaudit.DEL.real.tsv 
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+npsv_svclassify/%.npsv.vcf npsv_svclassify/%.sim.tsv npsv_svclassify/%.real.tsv : svclassify_inputs/%.vcf.gz $(BAM) $(notdir $(BAM:.bam=.stats.json))
+	mkdir -p $(dir $@)
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) --profile $(PROFILE) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-gt-mode variant --DEL-n $(ITER) --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-n $(ITER) --INS-classifier $(VARIANT_KLASS)
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+# Construct total simulated and real data
+NA12878.giab-svclassify-deletions-2015-05-22.sim.tsv : $(foreach start, $(SVCLASSIFY_BLOCKS), npsv_svclassify/giab-svclassify-deletions-2015-05-22.$(start)_$(shell expr $(start) + 100 - 1 ).sim.tsv) npsv_svclassify/giab-svclassify-deletions-2015-05-22.2601_2676.sim.tsv
+	head -n 1 $< > $@
+	tail -q -n+2 $^ >> $@
+
+NA12878.giab-svclassify-deletions-2015-05-22.real.tsv : $(foreach start, $(SVCLASSIFY_BLOCKS), npsv_svclassify/giab-svclassify-deletions-2015-05-22.$(start)_$(shell expr $(start) + 100 - 1 ).real.tsv) npsv_svclassify/giab-svclassify-deletions-2015-05-22.2601_2676.real.tsv
+	head -n 1 $< > $@
+	tail -q -n+2 $^ >> $@
+
+# 'Single-model' VCF genotyping
+NA12878.giab-svclassify-deletions-2015-05-22.npsv.vcf.gz : giab-svclassify-deletions-2015-05-22.vcf.gz NA12878.giab-svclassify-deletions-2015-05-22.sim.tsv NA12878.giab-svclassify-deletions-2015-05-22.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 --downsample 1 \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS)  \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# 'Per-variant' VCF genotyping
+NA12878.giab-svclassify-deletions-2015-05-22.variant.npsv.vcf.gz : giab-svclassify-deletions-2015-05-22.vcf.gz NA12878.giab-svclassify-deletions-2015-05-22.sim.tsv NA12878.giab-svclassify-deletions-2015-05-22.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 \
+		--DEL-gt-mode variant --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-classifier $(VARIANT_KLASS) --dm2 | bgzip > $@
+	bcftools index -t $@
+
+# 'Hybrid' VCF genotyping
+NA12878.giab-svclassify-deletions-2015-05-22.hybrid.npsv.vcf.gz : giab-svclassify-deletions-2015-05-22.vcf.gz NA12878.giab-svclassify-deletions-2015-05-22.sim.tsv NA12878.giab-svclassify-deletions-2015-05-22.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 --downsample 1 \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Polaris
+
+npsv_polaris/%.npsv.vcf npsv_polaris/%.sim.tsv npsv_polaris/%.real.tsv : polaris_inputs/%.vcf.gz $(BAM) $(notdir $(BAM:.bam=.stats.json))
+	mkdir -p $(dir $@)
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) --profile $(PROFILE) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-gt-mode variant --DEL-n $(ITER) --DEL-classifier $(VARIANT_KLASS) \
+  		--INS-gt-mode variant --INS-n $(ITER) --INS-classifier $(VARIANT_KLASS)
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+# Construct total simulated and real data
+npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.sim.tsv : $(foreach start, $(POLARIS_BLOCKS), npsv_polaris/illumina-polaris-v2.0.genoytped.passing.$(start)_$(shell expr $(start) + $(BLOCK_SIZE) - 1 ).sim.tsv) npsv_polaris/illumina-polaris-v2.0.genoytped.passing.$(POLARIS_LAST).sim.tsv
+	head -n 1 $< > $@
+	tail -q -n+2 $^ >> $@
+
+npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.real.tsv : $(foreach start, $(POLARIS_BLOCKS), npsv_polaris/illumina-polaris-v2.0.genoytped.passing.$(start)_$(shell expr $(start) + $(BLOCK_SIZE) - 1 ).real.tsv) npsv_polaris/illumina-polaris-v2.0.genoytped.passing.$(POLARIS_LAST).real.tsv
+	head -n 1 $< > $@
+	tail -q -n+2 $^ >> $@
+
+# 'Single-model' VCF genotyping
+NA12878.illumina-polaris-v2.0.genoytped.passing.single.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.sim.tsv npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.real.tsv 
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 --downsample 1 \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS)  \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# 'Per-variant' VCF genotyping
+NA12878.illumina-polaris-v2.0.genoytped.passing.variant.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.sim.tsv npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 \
+		--DEL-gt-mode variant --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-classifier $(VARIANT_KLASS) --dm2 | bgzip > $@
+	bcftools index -t $@
+
+# 'Hybrid' VCF genotyping
+NA12878.illumina-polaris-v2.0.genoytped.passing.hybrid.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.sim.tsv npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 --downsample 1 \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+
+npsv_polaris_NA12891/%.npsv.vcf npsv_polaris_NA12891/%.sim.tsv npsv_polaris_NA12891/%.real.tsv : polaris_inputs/%.vcf.gz $(PAT_BAM) $(notdir $(PAT_BAM:.bam=.stats.json))
+	mkdir -p $(dir $@)
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) --profile $(PROFILE) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-gt-mode variant --DEL-n $(ITER) --DEL-classifier $(VARIANT_KLASS) \
+  		--INS-gt-mode variant --INS-n $(ITER) --INS-classifier $(VARIANT_KLASS)
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+# Construct total simulated and real data
+npsv_polaris_NA12891/NA12891.illumina-polaris-v2.0.genoytped.passing.sim.tsv : $(foreach start, $(POLARIS_BLOCKS), npsv_polaris_NA12891/illumina-polaris-v2.0.genoytped.passing.$(start)_$(shell expr $(start) + $(BLOCK_SIZE) - 1 ).sim.tsv) npsv_polaris_NA12891/illumina-polaris-v2.0.genoytped.passing.$(POLARIS_LAST).sim.tsv
+	head -n 1 $< > $@
+	tail -q -n+2 $^ >> $@
+
+npsv_polaris_NA12891/NA12891.illumina-polaris-v2.0.genoytped.passing.real.tsv : $(foreach start, $(POLARIS_BLOCKS), npsv_polaris_NA12891/illumina-polaris-v2.0.genoytped.passing.$(start)_$(shell expr $(start) + $(BLOCK_SIZE) - 1 ).real.tsv) npsv_polaris_NA12891/illumina-polaris-v2.0.genoytped.passing.$(POLARIS_LAST).real.tsv
+	head -n 1 $< > $@
+	tail -q -n+2 $^ >> $@
+
+# 'Single-model' VCF genotyping
+NA12891.illumina-polaris-v2.0.genoytped.passing.single.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris_NA12891/NA12891.illumina-polaris-v2.0.genoytped.passing.sim.tsv npsv_polaris_NA12891/NA12891.illumina-polaris-v2.0.genoytped.passing.real.tsv 
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12891 --downsample 1 \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS)  \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# 'Per-variant' VCF genotyping
+NA12891.illumina-polaris-v2.0.genoytped.passing.variant.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris_NA12891/NA12891.illumina-polaris-v2.0.genoytped.passing.sim.tsv npsv_polaris_NA12891/NA12891.illumina-polaris-v2.0.genoytped.passing.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12891 \
+		--DEL-gt-mode variant --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-classifier $(VARIANT_KLASS) --dm2 | bgzip > $@
+	bcftools index -t $@
+
+# 'Hybrid' VCF genotyping
+NA12891.illumina-polaris-v2.0.genoytped.passing.hybrid.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris_NA12891/NA12891.illumina-polaris-v2.0.genoytped.passing.sim.tsv npsv_polaris_NA12891/NA12891.illumina-polaris-v2.0.genoytped.passing.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12891 --downsample 1 \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+
+npsv_polaris_NA12892/%.npsv.vcf npsv_polaris_NA12892/%.sim.tsv npsv_polaris_NA12892/%.real.tsv : polaris_inputs/%.vcf.gz $(MAT_BAM) $(notdir $(MAT_BAM:.bam=.stats.json))
+	mkdir -p $(dir $@)
+	npsv $(LOG_LEVEL) --tempdir $(TEMPDIR) --threads $(THREADS) \
+		--reference-sequence $(REFERENCE) \
+		--genome $(GENOME) \
+		--gaps $(GAPS) \
+		--stats-path $(word 3,$^) --profile $(PROFILE) \
+		--n $(ITER) \
+		$(REUSE) \
+		$(SIMREF) \
+		-i $< \
+		-b $(word 2,$^) \
+		-o $(TEMPDIR) \
+		--prefix $* \
+		--DEL-gt-mode variant --DEL-n $(ITER) --DEL-classifier $(VARIANT_KLASS) \
+  		--INS-gt-mode variant --INS-n $(ITER) --INS-classifier $(VARIANT_KLASS)
+	mv $(TEMPDIR)/$*.npsv.vcf $(TEMPDIR)/$*.sim.tsv $(TEMPDIR)/$*.real.tsv $(dir $@)
+
+# Construct total simulated and real data
+npsv_polaris_NA12892/NA12892.illumina-polaris-v2.0.genoytped.passing.sim.tsv : $(foreach start, $(POLARIS_BLOCKS), npsv_polaris_NA12892/illumina-polaris-v2.0.genoytped.passing.$(start)_$(shell expr $(start) + $(BLOCK_SIZE) - 1 ).sim.tsv) npsv_polaris_NA12892/illumina-polaris-v2.0.genoytped.passing.$(POLARIS_LAST).sim.tsv
+	head -n 1 $< > $@
+	tail -q -n+2 $^ >> $@
+
+npsv_polaris_NA12892/NA12892.illumina-polaris-v2.0.genoytped.passing.real.tsv : $(foreach start, $(POLARIS_BLOCKS), npsv_polaris_NA12892/illumina-polaris-v2.0.genoytped.passing.$(start)_$(shell expr $(start) + $(BLOCK_SIZE) - 1 ).real.tsv) npsv_polaris_NA12892/illumina-polaris-v2.0.genoytped.passing.$(POLARIS_LAST).real.tsv
+	head -n 1 $< > $@
+	tail -q -n+2 $^ >> $@
+
+# 'Single-model' VCF genotyping
+NA12892.illumina-polaris-v2.0.genoytped.passing.single.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris_NA12892/NA12892.illumina-polaris-v2.0.genoytped.passing.sim.tsv npsv_polaris_NA12892/NA12892.illumina-polaris-v2.0.genoytped.passing.real.tsv 
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12892 --downsample 1 \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS)  \
+		--INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# 'Per-variant' VCF genotyping
+NA12892.illumina-polaris-v2.0.genoytped.passing.variant.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris_NA12892/NA12892.illumina-polaris-v2.0.genoytped.passing.sim.tsv npsv_polaris_NA12892/NA12892.illumina-polaris-v2.0.genoytped.passing.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12892 \
+		--DEL-gt-mode variant --DEL-classifier $(VARIANT_KLASS) \
+		--INS-gt-mode variant --INS-classifier $(VARIANT_KLASS) --dm2 | bgzip > $@
+	bcftools index -t $@
+
+# 'Hybrid' VCF genotyping
+NA12892.illumina-polaris-v2.0.genoytped.passing.hybrid.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris_NA12892/NA12892.illumina-polaris-v2.0.genoytped.passing.sim.tsv npsv_polaris_NA12892/NA12892.illumina-polaris-v2.0.genoytped.passing.real.tsv
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12892 --downsample 1 \
+		--DEL-gt-mode hybrid --DEL-classifier $(VARIANT_KLASS) --DEL-hybrid-threshold $(HYBRID_SIZE) --DEL-hybrid-classifier $(HYBRID_KLASS) \
+		--INS-gt-mode hybrid --INS-classifier $(VARIANT_KLASS) --INS-hybrid-threshold $(HYBRID_SIZE) --INS-hybrid-classifier $(HYBRID_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+
+# Trios
+
+ceph-trio.%.vcf.gz : NA12878.%.vcf.gz NA12891.%.vcf.gz NA12892.%.vcf.gz
+	bcftools merge -Oz -o $@ $^
+	bcftools index -t $@
+
+npsv_trios: \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.single.npsv.vcf.gz \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.variant.npsv.vcf.gz \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.hybrid.npsv.vcf.gz
+
+.PHONY: npsv_trios
+
+
+# Cross comparison
+
+$(eval $(call REAL_WITH_AC_template,0,NA12878,$(BAM),npsv_polaris))
+$(eval $(call REAL_WITH_AC_template,1,NA12878,$(BAM),npsv_polaris))
+$(eval $(call REAL_WITH_AC_template,2,NA12878,$(BAM),npsv_polaris))
+
+npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.DEL.real.tsv :  npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.0.real.tsv  npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.1.real.tsv  npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.2.real.tsv
+	head -n 1 $< > $@
+	awk 'BEGIN { OFS="\t"; } ! /^#/ && ($$4 == "DEL") { print; }' $^ >> $@
+
+# Overwrite sample name
+npsv_polaris/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878.sim.tsv : ../ashkenazi-trio/npsv_giab_combined/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.sim.tsv
+	awk 'BEGIN { OFS="\t"; } /^#/ { print; } ! /^#/ && ($$4 == "DEL" || $$4 == "INS") { $$5 = "NA12878"; print; }' $< > $@
+
+npsv_polaris/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878.real.tsv : ../ashkenazi-trio/npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.0.real.tsv ../ashkenazi-trio/npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.1.real.tsv ../ashkenazi-trio/npsv_giab_combined/HG002.HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.2.real.tsv
+	head -n 1 $< > $@
+	awk 'BEGIN { OFS="\t"; } ! /^#/ && ($$4 == "DEL" || $$4 == "INS") { $$5 = "NA12878"; print; }' $^ >> $@
+
+# 'Single-model' VCF genotyping
+NA12878.illumina-polaris-v2.0.genoytped.passing.HG002-sim.single.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878.sim.tsv npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.real.tsv 
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 --downsample 1 \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS) --INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+NA12878.illumina-polaris-v2.0.genoytped.passing.HG002-real.single.npsv.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz npsv_polaris/HG002_SVs_Tier1_v0.6.genotyped.passing.tier1and2.NA12878.real.tsv npsv_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.real.tsv 
+	npsvg -v genotype -i $< --sim $(word 2,$^) --real $(word 3,$^) --samples NA12878 --downsample 1 \
+		--DEL-gt-mode single --DEL-classifier $(SINGLE_KLASS) --INS-gt-mode single --INS-classifier $(SINGLE_KLASS) | bgzip > $@
+	bcftools index -t $@
+
+# Concordance
+define truvari_template =
+$(1)/summary.txt : $(2) $(3)
+	rm -rf $$(dir $$@)
+	truvari bench -f $(REFERENCE) -b $(3) -c $$< -o $$(dir $$@) \
+		--sizemax 15000000 -s 50 -S 30 --pctsim=0 -r 20 -O 0.6 \
+		--passonly --bSample NA12878 --cSample NA12878
+endef
+
+truvari_DEL_template = $(call truvari_template, $(1), $(2:.vcf.gz=.DEL.vcf.gz), $(3:.vcf.gz=.DEL.vcf.gz))
+truvari_INS_template = $(call truvari_template, $(1), $(2:.vcf.gz=.INS.vcf.gz), $(3:.vcf.gz=.INS.vcf.gz))
+
+# Compute the number of Mendelian errors using bcftools plugin
+%.mendelian.txt : %.vcf.gz
+	bcftools view -t ^X,Y,MT $< | bcftools +mendelian /dev/stdin -r GRCh37 -t NA12892,NA12891,NA12878 -c > $@
+
+%.len.csv : %/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py --sample NA12878 len $< > $@
+
+%.list.gq.csv : %/tp-call.vcf
+	python3 $(NPSV_ROOT)/paper/variant_stats.py --sample NA12878 list $< > $@
+
+$(eval $(call truvari_template, truvari_npsv_single_svplaudit_DEL, NA12878.svplaudit.DEL.single.npsv.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_npsv_variant_svplaudit_DEL, NA12878.svplaudit.DEL.variant.npsv.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_npsv_hybrid_svplaudit_DEL, NA12878.svplaudit.DEL.hybrid.npsv.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_npsv_single_polaris_DEL, NA12878.illumina-polaris-v2.0.genoytped.passing.single.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_npsv_variant_polaris_DEL, NA12878.illumina-polaris-v2.0.genoytped.passing.variant.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_npsv_hybrid_polaris_DEL, NA12878.illumina-polaris-v2.0.genoytped.passing.hybrid.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_npsv_single_polaris_INS, NA12878.illumina-polaris-v2.0.genoytped.passing.single.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_npsv_variant_polaris_INS, NA12878.illumina-polaris-v2.0.genoytped.passing.variant.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_npsv_hybrid_polaris_INS, NA12878.illumina-polaris-v2.0.genoytped.passing.hybrid.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+
+$(eval $(call truvari_template, truvari_npsv_single_svplaudit_confirmed_DEL, NA12878.svplaudit.DEL.single.npsv.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_npsv_variant_svplaudit_confirmed_DEL, NA12878.svplaudit.DEL.variant.npsv.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_npsv_hybrid_svplaudit_confirmed_DEL, NA12878.svplaudit.DEL.hybrid.npsv.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+
+
+npsv_concordance: \
+	truvari_npsv_single_svplaudit_DEL/summary.txt \
+	truvari_npsv_variant_svplaudit_DEL/summary.txt \
+	truvari_npsv_hybrid_svplaudit_DEL/summary.txt \
+	truvari_npsv_single_svplaudit_confirmed_DEL/summary.txt \
+	truvari_npsv_variant_svplaudit_confirmed_DEL/summary.txt \
+	truvari_npsv_hybrid_svplaudit_confirmed_DEL/summary.txt \
+	truvari_npsv_single_polaris_DEL/summary.txt \
+	truvari_npsv_variant_polaris_DEL/summary.txt \
+	truvari_npsv_hybrid_polaris_DEL/summary.txt \
+	truvari_npsv_single_polaris_INS/summary.txt \
+	truvari_npsv_variant_polaris_INS/summary.txt \
+	truvari_npsv_hybrid_polaris_INS/summary.txt \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.single.npsv.mendelian.txt \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.variant.npsv.mendelian.txt \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.hybrid.npsv.mendelian.txt \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.single.npsv.DEL.mendelian.txt \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.variant.npsv.DEL.mendelian.txt \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.hybrid.npsv.DEL.mendelian.txt \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.single.npsv.INS.mendelian.txt \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.variant.npsv.INS.mendelian.txt \
+	ceph-trio.illumina-polaris-v2.0.genoytped.passing.hybrid.npsv.INS.mendelian.txt \
+	truvari_npsv_single_svplaudit_DEL.list.gq.csv \
+	truvari_npsv_variant_svplaudit_DEL.list.gq.csv \
+	truvari_npsv_hybrid_svplaudit_DEL.list.gq.csv \
+	truvari_npsv_single_svplaudit_confirmed_DEL.list.gq.csv \
+	truvari_npsv_variant_svplaudit_confirmed_DEL.list.gq.csv \
+	truvari_npsv_hybrid_svplaudit_confirmed_DEL.list.gq.csv \
+	truvari_npsv_single_polaris_DEL.list.gq.csv \
+	truvari_npsv_variant_polaris_DEL.list.gq.csv \
+	truvari_npsv_hybrid_polaris_DEL.list.gq.csv \
+	truvari_npsv_single_polaris_INS.list.gq.csv \
+	truvari_npsv_variant_polaris_INS.list.gq.csv \
+	truvari_npsv_hybrid_polaris_INS.list.gq.csv
+
+.PHONY: npsv_concordance
+
+# Cross-sample concordance
+$(eval $(call truvari_DEL_template, truvari_npsv_cross_HG002_sim_single_polaris_DEL, NA12878.illumina-polaris-v2.0.genoytped.passing.HG002-sim.single.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_npsv_cross_HG002_sim_single_polaris_INS, NA12878.illumina-polaris-v2.0.genoytped.passing.HG002-sim.single.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_npsv_cross_HG002_real_single_polaris_DEL, NA12878.illumina-polaris-v2.0.genoytped.passing.HG002-real.single.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_npsv_cross_HG002_real_single_polaris_INS, NA12878.illumina-polaris-v2.0.genoytped.passing.HG002-real.single.npsv.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+
+
+cross_concordance : \
+	truvari_npsv_cross_HG002_sim_single_polaris_DEL/summary.txt \
+	truvari_npsv_cross_HG002_sim_single_polaris_INS/summary.txt \
+	truvari_npsv_cross_HG002_real_single_polaris_DEL/summary.txt \
+	truvari_npsv_cross_HG002_real_single_polaris_INS/summary.txt
+
+.PHONY: cross_concordance
+
+## NA12878 analysis
+
+# svviz2
+
+svviz2_svplaudit : svplaudit.DEL.vcf.gz
+	mkdir -p $(dir $@)
+	svviz2 \
+		--ref $(REFERENCE) -o $@ --report-only \
+		--variants <(bcftools annotate --set-id +'%CHROM\_%POS\_%INFO/END' $<) \
+		$(BAM) $(MAT_BAM) $(PAT_BAM) 
+
+svviz2_svplaudit/ceph-trio.svplaudit.DEL.svviz2_count.vcf.gz : svplaudit.DEL.vcf.gz
+	svviz22vcf --model count -i $< -r svviz2_svplaudit \
+		-s $(notdir $(BAM:.bam=)) \
+		-s $(notdir $(PAT_BAM:.bam=)) \
+		-s $(notdir $(MAT_BAM:.bam=)) \
+		-o /dev/stdout | \
+		bcftools reheader -s <(echo -e "NA12878\nNA12891\nNA12892") - | \
+		sed 's/\bnan\b/./g' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svviz2_svplaudit/%.svplaudit.DEL.svviz2_count.vcf.gz : svviz2_svplaudit/ceph-trio.svplaudit.DEL.svviz2_count.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+svviz2_svplaudit/ceph-trio.svplaudit.DEL.svviz2_mapq.vcf.gz : svplaudit.DEL.vcf.gz
+	svviz22vcf --model mapq -i $< -r svviz2_svplaudit \
+		-s $(notdir $(BAM:.bam=)) \
+		-s $(notdir $(PAT_BAM:.bam=)) \
+		-s $(notdir $(MAT_BAM:.bam=)) \
+		-o /dev/stdout | \
+		bcftools reheader -s <(echo -e "NA12878\nNA12891\nNA12892") - | \
+		sed 's/\bnan\b/./g' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svviz2_svplaudit/%.svplaudit.DEL.svviz2_mapq.vcf.gz : svviz2_svplaudit/ceph-trio.svplaudit.DEL.svviz2_mapq.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+svviz2_svclassify/%.report.tsv : svclassify_inputs/%.vcf.gz
+	mkdir -p $(dir $@)
+	svviz2 \
+		--ref $(REFERENCE) -o $(dir $@) --report-only \
+	  --variants <(bcftools annotate --set-id +'%CHROM\_%POS\_%INFO/END' $<) \
+	  $(BAM) $(MAT_BAM) $(PAT_BAM) 
+
+svviz2_svclassify/ceph-trio.giab-svclassify-deletions-2015-05-22.svviz2_count.vcf.gz : giab-svclassify-deletions-2015-05-22.vcf.gz
+	svviz22vcf --model count -i $< -r svviz2_classify \
+		-s $(notdir $(BAM:.bam=)) \
+		-s $(notdir $(PAT_BAM:.bam=)) \
+		-s $(notdir $(MAT_BAM:.bam=)) \
+		-o /dev/stdout | \
+		bcftools reheader -s <(echo -e "NA12878\nNA12891\nNA12892") - | \
+		sed 's/\bnan\b/./g' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svviz2_svclassify/%.giab-svclassify-deletions-2015-05-22.svviz2_count.vcf.gz : svviz2_svclassify/ceph-trio.giab-svclassify-deletions-2015-05-22.svviz2_count.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+svviz2_polaris/%.report.tsv : polaris_inputs/%.vcf.gz
+	mkdir -p $(dir $@)
+	svviz2 \
+		--ref $(REFERENCE) -o $(dir $@) --report-only \
+	  --variants <(bcftools annotate --set-id +'%CHROM\_%POS\_%INFO/END' $<) \
+	  $(BAM) $(MAT_BAM) $(PAT_BAM) 
+
+svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_count.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz
+	svviz22vcf --model count -i $< -r svviz2_polaris \
+		-s $(notdir $(BAM:.bam=)) \
+		-s $(notdir $(PAT_BAM:.bam=)) \
+		-s $(notdir $(MAT_BAM:.bam=)) \
+		-o /dev/stdout | \
+		bcftools reheader -s <(echo -e "NA12878\nNA12891\nNA12892") - | \
+		sed 's/\bnan\b/./g' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svviz2_polaris/%.illumina-polaris-v2.0.genoytped.passing.svviz2_count.vcf.gz : svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_count.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_mapq.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz
+	svviz22vcf --model mapq -i $< -r svviz2_polaris \
+		-s $(notdir $(BAM:.bam=)) \
+		-s $(notdir $(PAT_BAM:.bam=)) \
+		-s $(notdir $(MAT_BAM:.bam=)) \
+		-o /dev/stdout | \
+		bcftools reheader -s <(echo -e "NA12878\nNA12891\nNA12892") - | \
+		sed 's/\bnan\b/./g' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svviz2_polaris/%.illumina-polaris-v2.0.genoytped.passing.svviz2_mapq.vcf.gz : svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_mapq.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+
+$(eval $(call truvari_template, truvari_svviz2_count_svplaudit_DEL, svviz2_svplaudit/NA12878.svplaudit.DEL.svviz2_count.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_svviz2_mapq_svplaudit_DEL, svviz2_svplaudit/NA12878.svplaudit.DEL.svviz2_mapq.vcf.gz, svplaudit.DEL.vcf.gz))
+
+$(eval $(call truvari_DEL_template, truvari_svviz2_count_polaris_DEL, svviz2_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.svviz2_count.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_svviz2_count_polaris_INS, svviz2_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.svviz2_count.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_svviz2_mapq_polaris_DEL, svviz2_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.svviz2_mapq.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_svviz2_mapq_polaris_INS, svviz2_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.svviz2_mapq.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+
+$(eval $(call truvari_template, truvari_svviz2_count_svplaudit_confirmed_DEL, svviz2_svplaudit/NA12878.svplaudit.DEL.svviz2_count.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_svviz2_mapq_svplaudit_confirmed_DEL, svviz2_svplaudit/NA12878.svplaudit.DEL.svviz2_mapq.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+
+
+svviz2_concordance : \
+	truvari_svviz2_count_svplaudit_DEL/summary.txt \
+	truvari_svviz2_count_svplaudit_confirmed_DEL/summary.txt \
+	truvari_svviz2_mapq_svplaudit_DEL/summary.txt \
+	truvari_svviz2_mapq_svplaudit_confirmed_DEL/summary.txt \
+	truvari_svviz2_count_polaris_DEL/summary.txt \
+	truvari_svviz2_count_polaris_INS/summary.txt \
+	truvari_svviz2_mapq_polaris_DEL/summary.txt \
+	truvari_svviz2_mapq_polaris_INS/summary.txt \
+	svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_count.mendelian.txt \
+	svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_mapq.mendelian.txt \
+	svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_count.DEL.mendelian.txt \
+	svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_mapq.DEL.mendelian.txt \
+	svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_count.INS.mendelian.txt \
+	svviz2_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svviz2_mapq.INS.mendelian.txt \
+	truvari_svviz2_mapq_svplaudit_DEL.list.gq.csv \
+	truvari_svviz2_mapq_svplaudit_confirmed_DEL.list.gq.csv \
+	truvari_svviz2_mapq_polaris_DEL.list.gq.csv \
+	truvari_svviz2_mapq_polaris_INS.list.gq.csv
+
+.PHONY : svviz2_svplaudit svviz2_concordance
+
+# SVTyper trio analysis
+svtyper/NA12878.%.svtyper.vcf.gz : %.vcf.gz $(BAM)
+	svtyper -i <(bcftools view -G $<) -B $(BAM) -l $(notdir $(BAM)).json | \
+		sed 's/=""/="/' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svtyper/NA12891.%.svtyper.vcf.gz : %.vcf.gz $(PAT_BAM)
+	svtyper -i <(bcftools view -G $<) -B $(PAT_BAM) -l $(notdir $(PAT_BAM)).json | \
+		sed 's/=""/="/' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svtyper/NA12892.%.svtyper.vcf.gz : %.vcf.gz $(MAT_BAM)
+	svtyper -i <(bcftools view -G $<) -B $(MAT_BAM) -l $(notdir $(MAT_BAM)).json | \
+		sed 's/=""/="/' | \
+		bgzip > $@
+	bcftools index -t $@
+
+svtyper/ceph-trio.%.svtyper.vcf.gz : %.vcf.gz
+	mkdir -p $(dir $@)
+	svtyper -i <(bcftools view -G $<) -B $(BAM),$(PAT_BAM),$(MAT_BAM) -l ceph-trio.svtyper.json | \
+		sed 's/=""/="/' | \
+		bgzip -c > $@
+	bcftools index -t $@	
+
+$(eval $(call truvari_template, truvari_svtyper_svplaudit_DEL, svtyper/NA12878.svplaudit.DEL.svtyper.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_svtyper_polaris_DEL, svtyper/NA12878.illumina-polaris-v2.0.genoytped.passing.svtyper.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_svtyper_polaris_INS, svtyper/NA12878.illumina-polaris-v2.0.genoytped.passing.svtyper.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+
+$(eval $(call truvari_template, truvari_svtyper_svplaudit_confirmed_DEL, svtyper/NA12878.svplaudit.DEL.svtyper.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+
+
+svtyper_concordance: \
+	truvari_svtyper_svplaudit_DEL/summary.txt \
+	truvari_svtyper_svplaudit_confirmed_DEL/summary.txt \
+	truvari_svtyper_svplaudit_DEL.len.csv \
+	truvari_svtyper_polaris_DEL/summary.txt \
+	truvari_svtyper_polaris_INS/summary.txt \
+	svtyper/ceph-trio.svplaudit.DEL.svtyper.mendelian.txt \
+	svtyper/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svtyper.mendelian.txt \
+	svtyper/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svtyper.DEL.mendelian.txt \
+	svtyper/ceph-trio.illumina-polaris-v2.0.genoytped.passing.svtyper.INS.mendelian.txt \
+	truvari_svtyper_svplaudit_confirmed_DEL.list.gq.csv \
+	truvari_svtyper_polaris_DEL.list.gq.csv
+	
+
+.PHONY: svtyper_concordance
+
+# Paragraph
+
+paragraph_svplaudit/svplaudit.DEL.vcf.gz : svplaudit.DEL.vcf.gz
+	fixSVVCF -i $< | padAlleles -r $(REFERENCE) -i /dev/stdin | bcftools sort -Oz -o $@
+	bcftools index -t $@
+
+paragraph_svplaudit/genotypes.vcf.gz : paragraph_svplaudit/svplaudit.DEL.vcf.gz
+	mkdir -p $(dir $@)
+	multigrmpy.py \
+		--scratch-dir $(TEMPDIR) -t $(THREADS) \
+		-i $< \
+    	-m samples.txt \
+    	-r $(REFERENCE) \
+    	-o $(dir $@)
+	bcftools index -t $@
+
+paragraph_svplaudit/%.svplaudit.DEL.paragraph.vcf.gz : paragraph_svplaudit/genotypes.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+paragraph_svclassify/genotypes.vcf.gz : giab-svclassify-deletions-2015-05-22.vcf.gz
+	mkdir -p $(dir $@)
+	multigrmpy.py \
+		--scratch-dir $(TEMPDIR) -t $(THREADS) \
+		-i $< \
+		-m samples.txt \
+		-r $(REFERENCE) \
+		-o $(dir $@)
+	bcftools index -t $@
+
+paragraph_svclassify/%.giab-svclassify-deletions-2015-05-22.paragraph.vcf.gz : paragraph_svclassify/genotypes.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+paragraph_polaris/illumina-polaris-v2.0.genoytped.passing.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz
+	mkdir -p $(dir $@)
+	padAlleles -r $(REFERENCE) -i $< | bcftools sort -Oz -o $@
+	bcftools index -t $@
+
+paragraph_polaris/genotypes.vcf.gz : paragraph_polaris/illumina-polaris-v2.0.genoytped.passing.vcf.gz
+	mkdir -p $(dir $@)
+	multigrmpy.py \
+		--scratch-dir $(TEMPDIR) -t $(THREADS) \
+		-i $< \
+		-m samples.txt \
+		-r $(REFERENCE) \
+		-o $(dir $@)
+	bcftools index -t $@
+
+paragraph_polaris/%.illumina-polaris-v2.0.genoytped.passing.paragraph.vcf.gz : paragraph_polaris/genotypes.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+$(eval $(call truvari_template, truvari_paragraph_svplaudit_DEL, paragraph_svplaudit/NA12878.svplaudit.DEL.paragraph.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_paragraph_svplaudit_DEL_nofilt, paragraph_svplaudit/NA12878.svplaudit.DEL.paragraph.nofilt.vcf.gz, svplaudit.DEL.vcf.gz))
+
+$(eval $(call truvari_DEL_template, truvari_paragraph_polaris_DEL, paragraph_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.paragraph.vcf.gz, paragraph_polaris/illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_paragraph_polaris_DEL_nofilt, paragraph_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.paragraph.nofilt.vcf.gz, paragraph_polaris/illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_paragraph_polaris_INS, paragraph_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.paragraph.vcf.gz, paragraph_polaris/illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_paragraph_polaris_INS_nofilt, paragraph_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.paragraph.nofilt.vcf.gz, paragraph_polaris/illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+
+
+$(eval $(call truvari_template, truvari_paragraph_svplaudit_confirmed_DEL, paragraph_svplaudit/NA12878.svplaudit.DEL.paragraph.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_paragraph_svplaudit_confirmed_DEL_nofilt, paragraph_svplaudit/NA12878.svplaudit.DEL.paragraph.nofilt.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+
+
+paragraph_concordance: \
+	truvari_paragraph_svplaudit_DEL/summary.txt \
+	truvari_paragraph_svplaudit_DEL_nofilt/summary.txt \
+	truvari_paragraph_svplaudit_confirmed_DEL/summary.txt \
+	truvari_paragraph_svplaudit_confirmed_DEL_nofilt/summary.txt \
+	paragraph_svplaudit/genotypes.mendelian.txt \
+	truvari_paragraph_polaris_DEL/summary.txt \
+	truvari_paragraph_polaris_DEL_nofilt/summary.txt \
+	truvari_paragraph_polaris_INS/summary.txt \
+	truvari_paragraph_polaris_INS_nofilt/summary.txt \
+	paragraph_polaris/genotypes.mendelian.txt \
+	paragraph_polaris/genotypes.DEL.mendelian.txt \
+	paragraph_polaris/genotypes.INS.mendelian.txt \
+	truvari_paragraph_svplaudit_confirmed_DEL_nofilt.list.gq.csv \
+	truvari_paragraph_polaris_DEL_nofilt.list.gq.csv \
+	truvari_paragraph_polaris_INS_nofilt.list.gq.csv
+	
+
+.PHONY: paragraph_concordance
+
+# SV2 trio analysis
+
+sv2_genotypes/ceph-trio.svplaudit.DEL.vcf : svplaudit.DEL.vcf.gz
+	sv2 -M -i $(BAM) -v $< -snv $(SNV) -p $(PED) -o NA12878.svplaudit.DEL
+	sv2 -M -i $(PAT_BAM) -v $< -snv $(SNV) -p $(PED) -o NA12891.svplaudit.DEL
+	sv2 -M -i $(MAT_BAM) -v $< -snv $(SNV) -p $(PED) -o NA12892.svplaudit.DEL
+	sv2 -feats sv2_features -v $< -p $(PED) -o $(basename $(notdir $@))
+
+sv2_genotypes/ceph-trio.giab-svclassify-deletions-2015-05-22.vcf : giab-svclassify-deletions-2015-05-22.vcf.gz
+	sv2 -M -i $(BAM) -v $< -snv $(SNV) -p $(PED) -o NA12878.giab-svclassify-deletions-2015-05-22
+	sv2 -M -i $(PAT_BAM) -v $< -snv $(SNV) -p $(PED) -o NA12891.giab-svclassify-deletions-2015-05-22
+	sv2 -M -i $(MAT_BAM) -v $< -snv $(SNV) -p $(PED) -o NA12892.giab-svclassify-deletions-2015-05-22
+	sv2 -feats sv2_features -v $< -p $(PED) -o $(basename $(notdir $@))
+
+sv2_genotypes/ceph-trio.illumina-polaris-v2.0.genoytped.passing.vcf : illumina-polaris-v2.0.genoytped.passing.vcf.gz
+	sv2 -M -i $(BAM) -v $< -snv $(SNV) -p $(PED) -o NA12878.illumina-polaris-v2.0.genoytped.passing
+	sv2 -M -i $(PAT_BAM) -v $< -snv $(SNV) -p $(PED) -o NA12891.illumina-polaris-v2.0.genoytped.passing
+	sv2 -M -i $(MAT_BAM) -v $< -snv $(SNV) -p $(PED) -o NA12892.illumina-polaris-v2.0.genoytped.passing
+	sv2 -feats sv2_features -v $< -p $(PED) -o $(basename $(notdir $@))
+
+
+# Fix up VCF (e.g. removing problematic INFO entries) to facilitate Truvari comparison
+sv2_genotypes/NA12878.%.sv2.vcf.gz : sv2_genotypes/ceph-trio.%.vcf
+	sed '/^#/b; s/NA/./g' $< | bcftools norm -f $(REFERENCE) -c s - | bcftools annotate -h sv2.header -x INFO/GENES - | bcftools view -s NA12878 -Oz -o $@
+	bcftools index -t $@
+
+sv2_genotypes/ceph-trio.%.sv2.vcf.gz : sv2_genotypes/ceph-trio.%.vcf
+	sed '/^#/b; s/NA/./g' $< | bcftools norm -f $(REFERENCE) -c s - | bcftools annotate -x INFO/GENES -Oz -o $@ -
+	bcftools index -t $@
+
+# sv2 converts complex alleles to symbolic so pctsize can get thrown-off
+define truvari_sv2_template =
+$(1)/summary.txt : $(2) $(3)
+	rm -rf $$(dir $$@)
+	truvari bench -f $(REFERENCE) -b $$(word 2,$$^) -c $$< -o $$(dir $$@) \
+    --sizemax 15000000 -s 50 -S 30 --pctsim=0 --pctsize=0 -r 20 -O 0.6 \
+    --passonly --bSample NA12878 --cSample NA12878
+endef
+
+$(eval $(call truvari_sv2_template, truvari_sv2_svplaudit_DEL, sv2_genotypes/NA12878.svplaudit.DEL.sv2.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_sv2_template, truvari_sv2_svplaudit_DEL_nofilt, sv2_genotypes/NA12878.svplaudit.DEL.sv2.nofilt.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_sv2_template, truvari_sv2_polaris_DEL, sv2_genotypes/NA12878.illumina-polaris-v2.0.genoytped.passing.sv2.DEL.vcf.gz, illumina-polaris-v2.0.genoytped.passing.DEL.vcf.gz))
+$(eval $(call truvari_sv2_template, truvari_sv2_polaris_DEL_nofilt, sv2_genotypes/NA12878.illumina-polaris-v2.0.genoytped.passing.sv2.DEL.nofilt.vcf.gz, illumina-polaris-v2.0.genoytped.passing.DEL.vcf.gz))
+$(eval $(call truvari_sv2_template, truvari_sv2_polaris_INS, sv2_genotypes/NA12878.illumina-polaris-v2.0.genoytped.passing.sv2.INS.vcf.gz, illumina-polaris-v2.0.genoytped.passing.INS.vcf.gz))
+$(eval $(call truvari_sv2_template, truvari_sv2_polaris_INS_nofilt, sv2_genotypes/NA12878.illumina-polaris-v2.0.genoytped.passing.sv2.INS.nofilt.vcf.gz, illumina-polaris-v2.0.genoytped.passing.INS.vcf.gz))
+
+$(eval $(call truvari_sv2_template, truvari_sv2_svplaudit_confirmed_DEL, sv2_genotypes/NA12878.svplaudit.DEL.sv2.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+$(eval $(call truvari_sv2_template, truvari_sv2_svplaudit_confirmed_DEL_nofilt, sv2_genotypes/NA12878.svplaudit.DEL.sv2.nofilt.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+
+
+sv2_concordance: \
+	truvari_sv2_svplaudit_DEL/summary.txt \
+	truvari_sv2_svplaudit_DEL_nofilt/summary.txt \
+	truvari_sv2_svplaudit_confirmed_DEL/summary.txt \
+	truvari_sv2_svplaudit_confirmed_DEL_nofilt/summary.txt \
+	truvari_sv2_polaris_DEL/summary.txt \
+	truvari_sv2_polaris_DEL_nofilt/summary.txt \
+	truvari_sv2_polaris_INS/summary.txt \
+	truvari_sv2_polaris_INS_nofilt/summary.txt \
+	sv2_genotypes/ceph-trio.svplaudit.DEL.sv2.mendelian.txt \
+	sv2_genotypes/ceph-trio.illumina-polaris-v2.0.genoytped.passing.sv2.mendelian.txt \
+	sv2_genotypes/ceph-trio.illumina-polaris-v2.0.genoytped.passing.sv2.DEL.mendelian.txt \
+	sv2_genotypes/ceph-trio.illumina-polaris-v2.0.genoytped.passing.sv2.INS.mendelian.txt \
+	truvari_sv2_svplaudit_confirmed_DEL_nofilt.list.gq.csv \
+	truvari_sv2_polaris_DEL_nofilt.list.gq.csv \
+	truvari_sv2_polaris_INS_nofilt.list.gq.csv
+	
+
+.PHONY: sv2_concordance
+
+# Delly Genotyping
+
+delly/svplaudit.DEL.bcf : svplaudit.DEL.vcf.gz
+	fixSVVCF -i $< | bcftools view -Ob -o $@ -
+	bcftools index -c $@
+
+delly/%.bcf : %.vcf.gz
+	bcftools view -Ob -o $@ $<
+	bcftools index -c $@
+
+delly/NA12878.%.delly.bcf : delly/%.bcf
+	delly call -g $(REFERENCE) -v $< -o $@ -x $(DELLY_HOME)/excludeTemplates/human.hg19.excl.tsv $(BAM)
+
+delly/NA12891.%.delly.bcf : delly/%.bcf
+	delly call -g $(REFERENCE) -v $< -o $@ -x $(DELLY_HOME)/excludeTemplates/human.hg19.excl.tsv $(PAT_BAM)
+
+delly/NA12892.%.delly.bcf : delly/%.bcf
+	delly call -g $(REFERENCE) -v $< -o $@ -x $(DELLY_HOME)/excludeTemplates/human.hg19.excl.tsv $(MAT_BAM)
+
+delly/ceph-trio.%.delly.bcf : delly/NA12878.%.delly.bcf delly/NA12891.%.delly.bcf delly/NA12892.%.delly.bcf
+	bcftools merge -m id -Ob -o $@ $^
+	bcftools index -c $@ 
+
+# Unfortunately this drops sites instead of setting the FILTER columns
+delly/ceph-trio.%.delly.filter.bcf : delly/ceph-trio.%.delly.bcf
+	delly filter -f germline -o $@ $<
+
+delly/NA12878.%.filter.vcf.gz : delly/ceph-trio.%.filter.bcf
+	bcftools view -s NA12878 -Oz -o $@ $<
+	bcftools index -t $@
+
+delly/NA12878.%.nofilt.vcf.gz : delly/ceph-trio.%.bcf
+	bcftools view -s NA12878 -Ov $< | bcftools annotate -Oz -o $@ -x "FILTER" -
+	bcftools index -t $@
+
+delly/ceph-trio.illumina-polaris-v2.0.genoytped.passing.delly.DEL.vcf.gz : delly/ceph-trio.illumina-polaris-v2.0.genoytped.passing.delly.bcf
+	bcftools view -Oz -o $@ -i '(SVTYPE ~ "^DEL")' $<
+	bcftools index -t $@	
+
+delly/ceph-trio.illumina-polaris-v2.0.genoytped.passing.delly.INS.vcf.gz : delly/ceph-trio.illumina-polaris-v2.0.genoytped.passing.delly.bcf
+	bcftools view -Oz -o $@ -i '(SVTYPE ~ "^INS")' $<
+	bcftools index -t $@
+
+$(eval $(call truvari_template, truvari_delly_svplaudit_DEL, delly/NA12878.svplaudit.DEL.delly.filter.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_delly_svplaudit_DEL_nofilt, delly/NA12878.svplaudit.DEL.delly.nofilt.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_delly_polaris_DEL, delly/NA12878.illumina-polaris-v2.0.genoytped.passing.delly.filter.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_delly_polaris_DEL_nofilt, delly/NA12878.illumina-polaris-v2.0.genoytped.passing.delly.nofilt.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_delly_polaris_INS, delly/NA12878.illumina-polaris-v2.0.genoytped.passing.delly.filter.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+$(eval $(call truvari_INS_template, truvari_delly_polaris_INS_nofilt, delly/NA12878.illumina-polaris-v2.0.genoytped.passing.delly.nofilt.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+
+$(eval $(call truvari_template, truvari_delly_svplaudit_confirmed_DEL, delly/NA12878.svplaudit.DEL.delly.filter.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_delly_svplaudit_confirmed_DEL_nofilt, delly/NA12878.svplaudit.DEL.delly.nofilt.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+
+truvari_delly%.list.gq.csv : truvari_delly%/tp-call.vcf
+	python3 /storage/mlinderman/projects/sv/testing/ashkenazi-trio/variant_stats.py --sample NA12878 list <(fixSVVCF -i $<) > $@
+
+delly_concordance : \
+	truvari_delly_svplaudit_DEL/summary.txt \
+	truvari_delly_svplaudit_DEL_nofilt/summary.txt \
+	truvari_delly_svplaudit_confirmed_DEL/summary.txt \
+	truvari_delly_svplaudit_confirmed_DEL_nofilt/summary.txt \
+	truvari_delly_polaris_DEL/summary.txt \
+	truvari_delly_polaris_DEL_nofilt/summary.txt \
+	truvari_delly_polaris_INS/summary.txt \
+	truvari_delly_polaris_INS_nofilt/summary.txt \
+	delly/ceph-trio.illumina-polaris-v2.0.genoytped.passing.delly.DEL.mendelian.txt \
+	delly/ceph-trio.illumina-polaris-v2.0.genoytped.passing.delly.INS.mendelian.txt \
+	truvari_delly_svplaudit_confirmed_DEL_nofilt.list.gq.csv \
+	truvari_delly_polaris_DEL_nofilt.list.gq.csv \
+	truvari_delly_polaris_INS_nofilt.list.gq.csv
+
+	
+
+.PHONY: delly_concordance
+
+
+# GraphTyper 2 (https://github.com/DecodeGenetics/graphtyper)
+
+graphtyper_svplaudit/svplaudit.DEL.vcf.gz : svplaudit.DEL.vcf.gz
+	mkdir -p $(dir $@)
+	fixSVVCF -i $< | awk -F$$'\t' '{ gsub(";","|",$$3); print; }' OFS=$$'\t' | bgzip -c > $@
+	bcftools index -t $@
+
+graphtyper_svplaudit/ceph-trio.svplaudit.DEL.graphtyper.vcf.gz : graphtyper_svplaudit/svplaudit.DEL.vcf.gz bams.txt
+	mkdir -p $(dir $@)
+	graphtyper genotype_sv $(REFERENCE) $< \
+		--output=$(dir $@) \
+		--sams=bams.txt \
+		--region_file=region.list \
+		--force_no_copy_reference --threads=$(THREADS)
+	bcftools concat --naive $(dir $@)/**/*.vcf.gz | bcftools sort -Oz -o $@ -
+	bcftools index -t $@
+
+# Select the "AGGREGATED" model
+graphtyper_svplaudit/ceph-trio.svplaudit.DEL.graphtyper.DEL.vcf.gz : graphtyper_svplaudit/ceph-trio.svplaudit.DEL.graphtyper.vcf.gz
+	bcftools view -i '(SVTYPE ~ "^DEL" && INFO/SVMODEL=="AGGREGATED")' -Oz -o $@ $<
+	bcftools index -t $@
+
+graphtyper_svplaudit/%.svplaudit.DEL.graphtyper.DEL.vcf.gz : graphtyper_svplaudit/ceph-trio.svplaudit.DEL.graphtyper.DEL.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+
+graphtyper_polaris/illumina-polaris-v2.0.genoytped.passing.vcf.gz : illumina-polaris-v2.0.genoytped.passing.vcf.gz
+	mkdir -p $(dir $@)
+	gzip -dc $< | awk -F$$'\t' '{ gsub(";","|",$$3); print; }' OFS=$$'\t' | bgzip -c > $@
+	bcftools index -t $@
+
+graphtyper_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.graphtyper.vcf.gz : graphtyper_polaris/illumina-polaris-v2.0.genoytped.passing.vcf.gz bams.txt
+	mkdir -p $(dir $@)
+	graphtyper genotype_sv $(REFERENCE) $< \
+		--output=$(dir $@) \
+		--sams=bams.txt \
+		--region_file=region.list \
+		--force_no_copy_reference --threads=$(THREADS)
+	bcftools concat --naive $(dir $@)/**/*.vcf.gz | bcftools sort -Oz -o $@ -
+	bcftools index -t $@	 
+
+# Select the "AGGREGATED" model
+graphtyper_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.graphtyper.DEL.vcf.gz : graphtyper_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.graphtyper.vcf.gz
+	bcftools view -i '(SVTYPE ~ "^DEL" && INFO/SVMODEL=="AGGREGATED")' -Oz -o $@ $<
+	bcftools index -t $@
+
+graphtyper_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.graphtyper.INS.vcf.gz : graphtyper_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.graphtyper.vcf.gz
+	bcftools view -i '((SVTYPE ~ "^INS" || SVTYPE ~ "^DUP") && INFO/SVMODEL=="AGGREGATED")' $< | sed '/^#/!s/DUP/INS/g' | bgzip -c > $@
+	bcftools index -t $@
+
+graphtyper_polaris/%.illumina-polaris-v2.0.genoytped.passing.graphtyper.DEL.vcf.gz : graphtyper_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.graphtyper.DEL.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+graphtyper_polaris/%.illumina-polaris-v2.0.genoytped.passing.graphtyper.INS.vcf.gz : graphtyper_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.graphtyper.INS.vcf.gz
+	bcftools view -s $* -Oz -o $@ $<
+	bcftools index -t $@
+
+$(eval $(call truvari_template, truvari_graphtyper_svplaudit_DEL, graphtyper_svplaudit/NA12878.svplaudit.DEL.graphtyper.DEL.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_svplaudit_DEL_nofilt, graphtyper_svplaudit/NA12878.svplaudit.DEL.graphtyper.DEL.nofilt.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_polaris_DEL, graphtyper_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.graphtyper.DEL.vcf.gz, illumina-polaris-v2.0.genoytped.passing.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_polaris_DEL_nofilt, graphtyper_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.graphtyper.DEL.nofilt.vcf.gz, illumina-polaris-v2.0.genoytped.passing.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_polaris_INS, graphtyper_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.graphtyper.INS.vcf.gz, illumina-polaris-v2.0.genoytped.passing.INS.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_polaris_INS_nofilt, graphtyper_polaris/NA12878.illumina-polaris-v2.0.genoytped.passing.graphtyper.INS.nofilt.vcf.gz, illumina-polaris-v2.0.genoytped.passing.INS.vcf.gz))
+
+$(eval $(call truvari_template, truvari_graphtyper_svplaudit_confirmed_DEL, graphtyper_svplaudit/NA12878.svplaudit.DEL.graphtyper.DEL.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_graphtyper_svplaudit_confirmed_DEL_nofilt, graphtyper_svplaudit/NA12878.svplaudit.DEL.graphtyper.DEL.nofilt.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+
+
+graphtyper_concordance: \
+	truvari_graphtyper_svplaudit_DEL/summary.txt \
+	truvari_graphtyper_svplaudit_DEL_nofilt/summary.txt \
+	truvari_graphtyper_svplaudit_confirmed_DEL/summary.txt \
+	truvari_graphtyper_svplaudit_confirmed_DEL_nofilt/summary.txt \
+	truvari_graphtyper_polaris_DEL/summary.txt \
+	truvari_graphtyper_polaris_DEL_nofilt/summary.txt \
+	truvari_graphtyper_polaris_INS/summary.txt \
+	truvari_graphtyper_polaris_INS_nofilt/summary.txt \
+	graphtyper_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.graphtyper.DEL.mendelian.txt \
+	graphtyper_polaris/ceph-trio.illumina-polaris-v2.0.genoytped.passing.graphtyper.INS.mendelian.txt
+	truvari_graphtyper_svplaudit_confirmed_DEL_nofilt.list.gq.csv \
+	truvari_graphtyper_polaris_DEL_nofilt.list.gq.csv \
+	truvari_graphtyper_polaris_INS_nofilt.list.gq.csv
+	
+
+.PHONY: graphtyper_concordance
+
+# GenomeStrip
+
+SV_METADATA_DIR ?= /storage/mlinderman/ngs/resources/genomestrip/1000G_phase1
+
+genomestrip_preprocessing: 
+	java -Xmx4g -cp $(CLASSPATH) \
+		-Djava.io.tmpdir=$(TEMPDIR) \
+		org.broadinstitute.gatk.queue.QCommandLine \
+		-S $(SV_DIR)/qscript/SVPreprocess.q \
+		-S $(SV_DIR)/qscript/SVQScript.q \
+		-cp $(CLASSPATH) \
+		-gatk $(SV_DIR)/lib/gatk/GenomeAnalysisTK.jar \
+		-configFile $(SV_DIR)/conf/genstrip_parameters.txt \
+		-ploidyMapFile $(SV_METADATA_DIR)/human_g1k_v37.ploidymap.txt \
+		-R $(REFERENCE) \
+		-I /storage/mlinderman/ngs/resources/ceph-trio/b37/final/NA12878/NA12878-ready-withLB.bam \
+		-I /storage/mlinderman/ngs/resources/ceph-trio/b37/final//NA12891/NA12891-ready-withLB.bam \
+		-I /storage/mlinderman/ngs/resources/ceph-trio/b37/final//NA12892/NA12892-ready-withLB.bam \
+		-md $@ \
+		-bamFilesAreDisjoint true \
+		-jobLogDir genomestrip_log \
+		-jobRunner ParallelShell -maxConcurrentRun $(THREADS) \
+		-run
+
+genomestrip/ceph-trio.%.genomestrip.vcf.gz : %.vcf.gz
+	mkdir -p $(dir $@)
+	java -Xmx4g -cp $(CLASSPATH) \
+		-Djava.io.tmpdir=$(TEMPDIR) \
+    	org.broadinstitute.gatk.queue.QCommandLine \
+    	-S $(SV_DIR)/qscript/SVGenotyper.q \
+    	-S $(SV_DIR)/qscript/SVQScript.q \
+		-cp $(CLASSPATH) \
+		-gatk $(SV_DIR)/lib/gatk/GenomeAnalysisTK.jar \
+		-configFile $(SV_DIR)/conf/genstrip_parameters.txt \
+		-rmd $(SV_METADATA_DIR) \
+		-R $(REFERENCE) \
+		-genomeMaskFile $(SV_METADATA_DIR)/human_g1k_v37.svmask.fasta \
+		-genderMapFile genomestrip.gender.txt \
+		-ploidyMapFile $(SV_METADATA_DIR)/human_g1k_v37.ploidymap.txt \
+		-md genomestrip_preprocessing \
+		-runDirectory $(dir $@) \
+		-vcf $< \
+		-I /storage/mlinderman/ngs/resources/ceph-trio/b37/final/NA12878/NA12878-ready-withLB.bam \
+		-I /storage/mlinderman/ngs/resources/ceph-trio/b37/final//NA12891/NA12891-ready-withLB.bam \
+		-I /storage/mlinderman/ngs/resources/ceph-trio/b37/final//NA12892/NA12892-ready-withLB.bam \
+		-O $@ \
+		-bamFilesAreDisjoint true \
+		-jobLogDir genomestrip_log \
+		-jobRunner ParallelShell -maxConcurrentRun $(THREADS) \
+		-run
+
+# Remove FORMAT field that seems to be causing bcftools parsing errors
+genomestrip/%.genomestrip.clean.vcf.gz : genomestrip/%.genomestrip.vcf.gz
+	gzip -dc $< | sed 's/:NA:/:.:/g' | bcftools annotate -Oz -o $@ -x FORMAT/CNF -
+	bcftools index -t $@
+
+genomestrip/NA12878.%.genomestrip.vcf.gz : genomestrip/ceph-trio.%.genomestrip.clean.vcf.gz
+	bcftools view -s NA12878 -Oz -o $@ $<
+	bcftools index -t $@
+
+$(eval $(call truvari_template, truvari_genomestrip_svplaudit_DEL, genomestrip/NA12878.svplaudit.DEL.genomestrip.vcf.gz, svplaudit.DEL.vcf.gz))
+$(eval $(call truvari_template, truvari_genomestrip_svplaudit_confirmed_DEL, genomestrip/NA12878.svplaudit.DEL.genomestrip.vcf.gz, svplaudit.confirmed.DEL.vcf.gz))
+$(eval $(call truvari_DEL_template, truvari_genomestrip_polaris_DEL, genomestrip/NA12878.illumina-polaris-v2.0.genoytped.passing.DEL.genomestrip.vcf.gz, illumina-polaris-v2.0.genoytped.passing.vcf.gz))
+
+genomestrip_concordance: \
+	truvari_genomestrip_svplaudit_DEL/summary.txt \
+	truvari_genomestrip_svplaudit_confirmed_DEL/summary.txt \
+	truvari_genomestrip_polaris_DEL/summary.txt \
+	genomestrip/ceph-trio.svplaudit.DEL.genomestrip.mendelian.txt \
+	genomestrip/ceph-trio.illumina-polaris-v2.0.genoytped.passing.DEL.genomestrip.clean.mendelian.txt \
+	genomestrip/ceph-trio.illumina-polaris-v2.0.genoytped.passing.DEL.genomestrip.clean.DEL.mendelian.txt \
+	truvari_genomestrip_svplaudit_DEL.len.csv \
+	truvari_genomestrip_polaris_DEL.len.csv \
+	truvari_genomestrip_svplaudit_confirmed_DEL.list.gq.csv \
+	truvari_genomestrip_polaris_DEL.list.gq.csv
+	
+	
+	
+.PHONY: genomestrip_preprocessing genomestrip_concordance	
+
+
+# Statistical testing of svplaudit genotypes
+
+# Convert sequence resolved alleles to symbolic alleles
+svplaudit.DEL.symbolic.vcf.gz : svplaudit.DEL.vcf.gz
+	fixSVVCF --symbolic -i $< | bgzip -c > $@
+	bctools index -t $@
+
+%.simplified.vcf.gz : %.vcf.gz
+	gzip -dc $< | sed -e 's/<DEL[^>]*>/<DEL>/' | fixSVVCF -i /dev/stdin | bgzip -c > $@
+	bcftools index -t $@
+
+# Annotation doesn't match sequence resolved to symbolic...
+%.svp_score.tsv : %.vcf.gz
+	bcftools query -f '%INFO/SVP\t%INFO/SVPD\t[%GT]\n' <(gzip -dc $< | sed -e 's/SVPD,Number=./SVPD,Number=3/') > $@
+
+delly/NA12878.svplaudit.DEL.delly.nofilt.svp_score.tsv : delly/NA12878.svplaudit.DEL.delly.nofilt.vcf.gz
+	bcftools query -f '%INFO/SVP\t%INFO/SVPD\t[%GT]\n' \
+	    <(bcftools annotate -a svplaudit.DEL.symbolic.vcf.gz -c INFO/SVP,INFO/SVPD $< | sed -e 's/SVPD,Number=./SVPD,Number=3/') > $@
+
+sv2_genotypes/NA12878.svplaudit.DEL.sv2.nofilt.svp_score.tsv : sv2_genotypes/NA12878.svplaudit.DEL.sv2.nofilt.simplified.vcf.gz
+	bcftools query -f '%INFO/SVP\t%INFO/SVPD\t[%GT]\n' \
+	    <(bcftools annotate -a svplaudit.DEL.symbolic.vcf.gz -c INFO/SVP,INFO/SVPD $< | sed -e 's/SVPD,Number=./SVPD,Number=3/') > $@
+
+graphtyper_svplaudit/NA12878.svplaudit.DEL.graphtyper.DEL.nofilt.clean.vcf.gz : graphtyper_svplaudit/NA12878.svplaudit.DEL.graphtyper.DEL.nofilt.vcf.gz
+	bcftools norm -c s -f $(REFERENCE) $< | sed -e 's/SVLEN=\([0-9]\+\)/SVLEN=-\1/' | sed -e 's/<DEL[^>]*>/<DEL>/' | bgzip -c > $@
+	bcftools index -t $@
+
+graphtyper_svplaudit/NA12878.svplaudit.DEL.graphtyper.DEL.nofilt.svp_score.tsv : graphtyper_svplaudit/NA12878.svplaudit.DEL.graphtyper.DEL.nofilt.clean.vcf.gz
+	bcftools query -f '%INFO/SVP\t%INFO/SVPD\t[%GT]\n' \
+	    <(bcftools annotate -a svplaudit.DEL.symbolic.vcf.gz -c INFO/SVP,INFO/SVPD $< | sed -e 's/SVPD,Number=./SVPD,Number=3/') > $@
+
+# Rscript compare_svp.R ...
+svp_scores : \
+	NA12878.svplaudit.DEL.single.npsv.svp_score.tsv \
+	NA12878.svplaudit.DEL.variant.npsv.svp_score.tsv \
+	NA12878.svplaudit.DEL.hybrid.npsv.svp_score.tsv \
+	svviz2_svplaudit/NA12878.svplaudit.DEL.svviz2_count.svp_score.tsv \
+	svviz2_svplaudit/NA12878.svplaudit.DEL.svviz2_mapq.svp_score.tsv \
+	svtyper/NA12878.svplaudit.DEL.svtyper.svp_score.tsv \
+	paragraph_svplaudit/NA12878.svplaudit.DEL.paragraph.nofilt.svp_score.tsv \
+	sv2_genotypes/NA12878.svplaudit.DEL.sv2.nofilt.svp_score.tsv \
+	delly/NA12878.svplaudit.DEL.delly.nofilt.svp_score.tsv \
+	graphtyper_svplaudit/NA12878.svplaudit.DEL.graphtyper.DEL.nofilt.svp_score.tsv
+
+
+.PHONY: svp_scores
+
+.SECONDARY:
